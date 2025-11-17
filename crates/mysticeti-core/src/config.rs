@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crypto::types::ark_se_de_as_bytes;
 use std::{
     fs,
     io,
@@ -8,7 +9,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-
+use ark_bls12_381::Bls12_381;
+use ark_groth16::VerifyingKey;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
@@ -257,6 +259,45 @@ impl NodePrivateConfig {
 impl ImportExport for NodePrivateConfig {}
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct CryptoConfig {
+    #[serde(default = "crypto_defaults::default_num_candidates")]
+    pub num_candidates: usize,
+    #[serde(default = "crypto_defaults::default_merkle_root")]
+    pub merkle_root: String,
+    #[serde(default = "crypto_defaults::default_global_seed")]
+    pub global_seed: u64,
+    #[serde(default = "crypto_defaults::default_verifying_key", with = "ark_se_de_as_bytes")]
+    pub verifying_key: VerifyingKey<Bls12_381>,
+}
+
+pub mod crypto_defaults {
+    use ark_bls12_381::Bls12_381;
+    use ark_groth16::VerifyingKey;
+
+    pub fn default_num_candidates() -> usize { 3 }
+    pub fn default_merkle_root() -> String {
+        String::new()
+    }
+    pub fn default_global_seed() -> u64 { 12345678910 }
+    pub fn default_verifying_key() -> VerifyingKey<Bls12_381> {
+        VerifyingKey::default()
+    }
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        Self {
+            num_candidates: crypto_defaults::default_num_candidates(),
+            merkle_root: crypto_defaults::default_merkle_root(),
+            global_seed: crypto_defaults::default_global_seed(),
+            verifying_key: crypto_defaults::default_verifying_key(),
+        }
+    }
+}
+
+impl ImportExport for CryptoConfig {}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ClientParameters {
     /// The number of transactions to send to the network per second.
     #[serde(default = "client_defaults::default_load")]
@@ -296,3 +337,5 @@ impl Default for ClientParameters {
 }
 
 impl ImportExport for ClientParameters {}
+
+

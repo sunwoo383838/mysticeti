@@ -1,0 +1,23 @@
+[package]
+name = "crypto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-std = { version = "0.5.0", features = ["std", "getrandom"] }
+ark-ff = "0.5.0"
+ark-ec = "0.5.0"
+ark-serialize = { version = "0.5.0", default-features = false, features = ["derive"] }
+ark-ed-on-bls12-381 = { version = "0.5.0", default-features = false, features = ["r1cs"] }
+
+ark-bls12-381 = { version = "0.5.0", default-features = false, features = ["curve"] }
+ark-groth16 = "0.5.0"
+ark-relations = "0.5.1"
+ark-r1cs-std = "0.5.0"
+
+ark-crypto-primitives = { version = "0.5.0", default-features = false, features = ["crh", "sponge", "merkle_tree", "r1cs", "encryption"] }
+thiserror = "2.0.17"
+
+serde = { workspace = true, version = "1.0.0", features = ["derive"] }
+serde_bytes = "0.11.19"
+bincode = "1.3.3"

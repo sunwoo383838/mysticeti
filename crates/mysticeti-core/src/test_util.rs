@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::Arc,
 };
-
+use ark_ed_on_bls12_381::Fr;
 use futures::future::join_all;
 use prometheus::Registry;
 use rand::{rngs::StdRng, SeedableRng};
@@ -16,19 +16,25 @@ use crate::future_simulator::OverrideNodeContext;
 #[cfg(feature = "simulator")]
 use crate::simulated_network::SimulatedNetwork;
 use crate::{
-    block_handler::{BlockHandler, TestBlockHandler, TestCommitHandler},
+    // ❗ TestCommitHandler 제거, CommitHandler, Log, NullifierDB 추가
+    block_handler::{BlockHandler, CommitHandler, TestBlockHandler},
     block_store::{BlockStore, BlockWriter, OwnBlockData, WAL_ENTRY_BLOCK},
     committee::Committee,
-    config::{self, NodePrivateConfig, NodePublicConfig},
+    // ❗ DkgManager, CryptoConfig, Notify, Mutex 추가 (NetworkSyncer::start를 위해)
+    config::{self, CryptoConfig, NodePrivateConfig, NodePublicConfig},
     core::{Core, CoreOptions},
     data::Data,
+    dkg_manager::DkgManager, // ❗ 추가
+    log::TransactionLog,    // ❗ 추가
     metrics::{MetricReporter, Metrics},
     net_sync::NetworkSyncer,
     network::Network,
+    nullifier::NullifierDB, // ❗ 추가
     syncer::{Syncer, SyncerSignals},
     types::{format_authority_index, AuthorityIndex, BlockReference, RoundNumber, StatementBlock},
     wal::{open_file_for_wal, walf, WalPosition, WalWriter},
 };
+use tokio::sync::{Mutex, Notify}; // ❗ 추가
 
 pub fn test_metrics() -> Arc<Metrics> {
     Metrics::new(&Registry::new(), None).0
@@ -82,6 +88,7 @@ pub fn committee_and_cores_persisted_epoch_duration(
     Vec<MetricReporter>,
 ) {
     let committee = committee(n);
+    let crypto_config = CryptoConfig::default();
     let cores: Vec<_> = committee
         .authorities()
         .map(|authority| {
@@ -110,6 +117,30 @@ pub fn committee_and_cores_persisted_epoch_duration(
 
             let private_config = NodePrivateConfig::new_for_tests(authority);
 
+            // --- ❗ (수정) Core::open에 전달할 CommitHandler 생성 ---
+            let nullifier_db = Arc::new(NullifierDB::new(metrics.clone()).unwrap());
+            // 테스트 로그는 임시 파일에 저장
+            let commit_log_path = tempfile::NamedTempFile::new().unwrap();
+            let committed_transaction_log = TransactionLog::start(commit_log_path.path()).unwrap();
+
+            let commit_handler = CommitHandler::new(
+                committee.clone(),
+                block_handler.transaction_time.clone(),
+                metrics.clone(),
+                nullifier_db,
+                committed_transaction_log,
+            );
+
+            let dkg_complete_notify = Arc::new(Notify::new());
+            let my_secret_share = Arc::new(Mutex::new(Option::<Fr>::None));
+            let dkg_manager = Arc::new(Mutex::new(DkgManager::new(
+                authority,
+                committee.clone(),
+                dkg_complete_notify.clone(),
+                &crypto_config, // ❗ 테스트용 config 전달
+            )));
+            // --- (수정 끝) ---
+
             println!("Opening core {authority}");
             let core = Core::open(
                 block_handler,
@@ -121,6 +152,10 @@ pub fn committee_and_cores_persisted_epoch_duration(
                 recovered,
                 wal_writer,
                 CoreOptions::test(),
+                commit_handler, // ❗ CommitHandler 인자 전달
+                dkg_manager.clone(),
+                dkg_complete_notify.clone(),
+                my_secret_share.clone(),
             );
             (core, reporter)
         })
@@ -137,7 +172,8 @@ pub fn committee_and_syncers(
     n: usize,
 ) -> (
     Arc<Committee>,
-    Vec<Syncer<TestBlockHandler, bool, TestCommitHandler>>,
+    // ❗ TestCommitHandler -> CommitHandler
+    Vec<Syncer<TestBlockHandler, bool>>,
 ) {
     let (committee, cores, _) = committee_and_cores(n);
     (
@@ -145,12 +181,11 @@ pub fn committee_and_syncers(
         cores
             .into_iter()
             .map(|core| {
-                let commit_handler = TestCommitHandler::new(
-                    committee.clone(),
-                    core.block_handler().transaction_time.clone(),
-                    test_metrics(),
-                );
-                Syncer::new(core, 3, Default::default(), commit_handler, test_metrics())
+                // ❌ commit_handler 생성 로직 제거
+                // let commit_handler = TestCommitHandler::new( ... );
+
+                // ❗ Syncer::new 시그니처 변경 (commit_handler 제거)
+                Syncer::new(core, 3, Default::default(), test_metrics())
             })
             .collect(),
     )
@@ -178,7 +213,8 @@ pub fn simulated_network_syncers(
     n: usize,
 ) -> (
     SimulatedNetwork,
-    Vec<NetworkSyncer<TestBlockHandler, TestCommitHandler>>,
+    // ❗ TestCommitHandler -> CommitHandler
+    Vec<NetworkSyncer<TestBlockHandler, CommitHandler>>,
     Vec<MetricReporter>,
 ) {
     simulated_network_syncers_with_epoch_duration(
@@ -193,26 +229,39 @@ pub fn simulated_network_syncers_with_epoch_duration(
     rounds_in_epoch: RoundNumber,
 ) -> (
     SimulatedNetwork,
-    Vec<NetworkSyncer<TestBlockHandler, TestCommitHandler>>,
+    // ❗ TestCommitHandler -> CommitHandler
+    Vec<NetworkSyncer<TestBlockHandler, CommitHandler>>,
     Vec<MetricReporter>,
 ) {
     let (committee, cores, reporters) = committee_and_cores_epoch_duration(n, rounds_in_epoch);
     let (simulated_network, networks) = SimulatedNetwork::new(&committee);
     let mut network_syncers = vec![];
     for (network, core) in networks.into_iter().zip(cores.into_iter()) {
-        let commit_handler = TestCommitHandler::new(
+        // ❌ commit_handler 생성 로직 제거
+        // let commit_handler = TestCommitHandler::new( ... );
+
+        // ❗ DkgManager 생성 (NetworkSyncer::start를 위해)
+        let dkg_complete_notify = Arc::new(Notify::new());
+        let crypto_config = CryptoConfig::default(); // 테스트용 기본값
+        let dkg_manager = Arc::new(Mutex::new(DkgManager::new(
+            core.authority(),
             committee.clone(),
-            core.block_handler().transaction_time.clone(),
-            core.metrics.clone(),
-        );
+            dkg_complete_notify.clone(),
+            &crypto_config,
+        )));
+
         let node_context = OverrideNodeContext::enter(Some(core.authority()));
+
+        // ❗ NetworkSyncer::start 시그니처 변경
         let network_syncer = NetworkSyncer::start(
             network,
             core,
             3,
-            commit_handler,
+            // commit_handler, // <- 제거
             config::node_defaults::default_shutdown_grace_period(),
             test_metrics(),
+            &NodePublicConfig::new_for_tests(n),
+            dkg_manager, // ❗ dkg_manager 전달
         );
         drop(node_context);
         network_syncers.push(network_syncer);
@@ -220,32 +269,44 @@ pub fn simulated_network_syncers_with_epoch_duration(
     (simulated_network, network_syncers, reporters)
 }
 
-pub async fn network_syncers(n: usize) -> Vec<NetworkSyncer<TestBlockHandler, TestCommitHandler>> {
+// ❗ TestCommitHandler -> CommitHandler
+pub async fn network_syncers(n: usize) -> Vec<NetworkSyncer<TestBlockHandler>> {
     network_syncers_with_epoch_duration(n, config::node_defaults::default_rounds_in_epoch()).await
 }
 
 pub async fn network_syncers_with_epoch_duration(
     n: usize,
     rounds_in_epoch: RoundNumber,
-) -> Vec<NetworkSyncer<TestBlockHandler, TestCommitHandler>> {
+    // ❗ TestCommitHandler -> CommitHandler
+) -> Vec<NetworkSyncer<TestBlockHandler>> {
     let (committee, cores, _) = committee_and_cores_epoch_duration(n, rounds_in_epoch);
     let metrics: Vec<_> = cores.iter().map(|c| c.metrics.clone()).collect();
     let (networks, _) = networks_and_addresses(&metrics).await;
     let mut network_syncers = vec![];
     for (network, core) in networks.into_iter().zip(cores.into_iter()) {
-        let commit_handler = TestCommitHandler::new(
+        // ❌ commit_handler 생성 로직 제거
+        // let commit_handler = TestCommitHandler::new( ... );
+
+        // ❗ DkgManager 생성 (NetworkSyncer::start를 위해)
+        let dkg_complete_notify = Arc::new(Notify::new());
+        let crypto_config = CryptoConfig::default(); // 테스트용 기본값
+        let dkg_manager = Arc::new(Mutex::new(DkgManager::new(
+            core.authority(),
             committee.clone(),
-            core.block_handler().transaction_time.clone(),
-            test_metrics(),
-        );
+            dkg_complete_notify.clone(),
+            &crypto_config,
+        )));
+
+        // ❗ NetworkSyncer::start 시그니처 변경
         let network_syncer = NetworkSyncer::start(
             network,
             core,
             3,
-            commit_handler,
+            // commit_handler, // <- 제거
             config::node_defaults::default_shutdown_grace_period(),
             test_metrics(),
             &NodePublicConfig::new_for_tests(n),
+            dkg_manager, // ❗ dkg_manager 전달
         );
         network_syncers.push(network_syncer);
     }
@@ -259,11 +320,13 @@ pub fn rng_at_seed(seed: u64) -> StdRng {
     StdRng::from_seed(seed)
 }
 
+// ❗ TestCommitHandler -> CommitHandler
 pub fn check_commits<H: BlockHandler, S: SyncerSignals>(
-    syncers: &[Syncer<H, S, TestCommitHandler>],
+    syncers: &[Syncer<H, S>],
 ) {
     let commits = syncers
         .iter()
+        // ❗ syncer.rs 수정 시 `commit_observer()`가 &CommitHandler를 반환하도록 수정 필요
         .map(|state| state.commit_observer().committed_leaders());
     let zero_commit = vec![];
     let mut max_commit = &zero_commit;
@@ -284,8 +347,9 @@ pub fn check_commits<H: BlockHandler, S: SyncerSignals>(
 }
 
 #[allow(dead_code)]
+// ❗ TestCommitHandler -> CommitHandler
 pub fn print_stats<S: SyncerSignals>(
-    syncers: &[Syncer<TestBlockHandler, S, TestCommitHandler>],
+    syncers: &[Syncer<TestBlockHandler, S>],
     reporters: &mut [MetricReporter],
 ) {
     assert_eq!(syncers.len(), reporters.len());

@@ -17,6 +17,7 @@ use mysticeti_core::{
     validator::Validator,
 };
 use tracing_subscriber::{filter::LevelFilter, fmt, EnvFilter};
+use mysticeti_core::config::CryptoConfig;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -57,6 +58,8 @@ enum Operation {
         /// Path to the file holding the client parameters (for benchmarks).
         #[clap(long, value_name = "FILE")]
         client_parameters_path: String,
+        #[clap(long, value_name = "FILE")]
+        crypto_config_path: String,
     },
     /// Deploy a local validator for test. Dryrun mode uses default keys and committee configurations.
     DryRun {
@@ -91,6 +94,7 @@ async fn main() -> Result<()> {
             public_config_path,
             private_config_path,
             client_parameters_path,
+            crypto_config_path,
         } => {
             run(
                 authority,
@@ -98,6 +102,7 @@ async fn main() -> Result<()> {
                 public_config_path,
                 private_config_path,
                 client_parameters_path,
+                crypto_config_path,
             )
             .await?
         }
@@ -173,6 +178,7 @@ async fn run(
     public_config_path: String,
     private_config_path: String,
     client_parameters_path: String,
+    crypto_config_path: String,
 ) -> Result<()> {
     tracing::info!("Starting validator {authority}");
 
@@ -186,6 +192,9 @@ async fn run(
     ))?;
     let client_parameters = ClientParameters::load(&client_parameters_path).wrap_err(format!(
         "Failed to load client parameters file '{client_parameters_path}'"
+    ))?;
+    let crypto_config = CryptoConfig::load(&crypto_config_path).wrap_err(format!(
+        "Failed to crypto configuration file '{crypto_config_path}'"
     ))?;
 
     let committee = Arc::new(committee);
@@ -211,6 +220,7 @@ async fn run(
         public_config.clone(),
         private_config,
         client_parameters,
+        crypto_config,
     )
     .await?;
     let (network_result, _metrics_result) = validator.await_completion().await;
@@ -227,6 +237,7 @@ async fn dryrun(authority: AuthorityIndex, committee_size: usize) -> Result<()> 
     let client_parameters = ClientParameters::default();
     let node_parameters = NodeParameters::default();
     let public_config = NodePublicConfig::new_for_benchmarks(ips, Some(node_parameters));
+    let crypto_config = CryptoConfig::default();
 
     let working_dir = PathBuf::from(format!("dryrun-validator-{authority}"));
     let mut all_private_config =
@@ -258,6 +269,7 @@ async fn dryrun(authority: AuthorityIndex, committee_size: usize) -> Result<()> 
         public_config,
         private_config,
         client_parameters,
+        crypto_config,
     )
     .await?;
     let (network_result, _metrics_result) = validator.await_completion().await;

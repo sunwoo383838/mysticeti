@@ -9,13 +9,21 @@ use std::{
     },
     time::Duration,
 };
-
+use ark_crypto_primitives::encryption::elgamal::Ciphertext;
+use ark_ec::{AffineRepr, CurveGroup};
+use ark_ed_on_bls12_381::{EdwardsAffine as JubJubAffine, EdwardsProjective as JubJub, Fr};
+use ark_ff::Zero;
+use ark_serialize::{serialize_to_vec, CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 use futures::future::join_all;
 use tokio::{
     select,
     sync::{mpsc, oneshot, Notify},
 };
-
+use tokio::sync::Mutex;
+use tokio::task::spawn_blocking;
+use crypto::elgamal;
+use crypto::elgamal::decode_vote;
+use crypto::types::ZKElgamalCiphertext;
 use crate::{
     block_handler::BlockHandler,
     block_store::BlockStore,
@@ -31,43 +39,44 @@ use crate::{
     types::{format_authority_index, AuthorityIndex},
     wal::WalSyncer,
 };
+use crate::dkg_manager::DkgManager;
+use crate::types::Transaction;
 
 /// The maximum number of blocks that can be requested in a single message.
 pub const MAXIMUM_BLOCK_REQUEST: usize = 10;
 
-pub struct NetworkSyncer<H: BlockHandler, C: CommitObserver> {
-    inner: Arc<NetworkSyncerInner<H, C>>,
+pub struct NetworkSyncer<H: BlockHandler> {
+    inner: Arc<NetworkSyncerInner<H>>,
     main_task: JoinHandle<()>,
     syncer_task: oneshot::Receiver<()>,
     stop: mpsc::Receiver<()>,
 }
 
-pub struct NetworkSyncerInner<H: BlockHandler, C: CommitObserver> {
-    pub syncer: CoreThreadDispatcher<H, Arc<Notify>, C>,
+pub struct NetworkSyncerInner<H: BlockHandler> {
+    pub syncer: Arc<CoreThreadDispatcher<H, Arc<Notify>>>,
     pub block_store: BlockStore,
     pub notify: Arc<Notify>,
     committee: Arc<Committee>,
     stop: mpsc::Sender<()>,
     epoch_close_signal: mpsc::Sender<()>,
     pub epoch_closing_time: Arc<AtomicU64>,
+    dkg_manager: Arc<Mutex<DkgManager>>
 }
 
-impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C> {
+impl<H: BlockHandler + 'static> NetworkSyncer<H> {
     pub fn start(
         network: Network,
         mut core: Core<H>,
         commit_period: u64,
-        mut commit_observer: C,
         shutdown_grace_period: Duration,
         metrics: Arc<Metrics>,
         public_config: &NodePublicConfig,
+        dkg_manager: Arc<Mutex<DkgManager>>,
     ) -> Self {
         let authority_index = core.authority();
         let handle = Handle::current();
         let notify = Arc::new(Notify::new());
         // todo - ugly, probably need to merge syncer and core
-        let (committed, state) = core.take_recovered_committed_blocks();
-        commit_observer.recover_committed(committed, state);
         let committee = core.committee().clone();
         let wal_syncer = core.wal_syncer();
         let block_store = core.block_store().clone();
@@ -76,11 +85,10 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
             core,
             commit_period,
             notify.clone(),
-            commit_observer,
             metrics.clone(),
         );
         syncer.force_new_block(0);
-        let syncer = CoreThreadDispatcher::start(syncer);
+        let syncer = Arc::new(CoreThreadDispatcher::start(syncer));
         let (stop_sender, stop_receiver) = mpsc::channel(1);
         stop_sender.try_send(()).unwrap(); // occupy the only available permit, so that all other calls to send() will block
         let (epoch_sender, epoch_receiver) = mpsc::channel(1);
@@ -93,6 +101,7 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
             stop: stop_sender.clone(),
             epoch_close_signal: epoch_sender.clone(),
             epoch_closing_time,
+            dkg_manager
         });
         let block_fetcher = Arc::new(BlockFetcher::start(
             authority_index,
@@ -117,7 +126,26 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
         }
     }
 
-    pub async fn shutdown(self) -> Syncer<H, Arc<Notify>, C> {
+    pub fn core_syncer_handle(&self) -> Arc<CoreThreadDispatcher<H, Arc<Notify>>> {
+        self.inner.syncer.clone()
+    }
+
+    pub async fn wait_for_all_peers(&self, committee_size: usize) {
+        loop {
+            // DkgManager에 등록된 피어 수 확인
+            let connected_count = self.inner.dkg_manager.lock().await.get_connected_peer_count();
+
+
+            if connected_count >= committee_size - 1 {
+                tracing::info!("All {connected_count} peers connected for DKG.");
+                break;
+            }
+            tracing::debug!("Waiting for peers... ({connected_count}/{})", committee_size - 1);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    pub async fn shutdown(self) -> Syncer<H, Arc<Notify>> {
         drop(self.stop);
         // todo - wait for network shutdown as well
         self.main_task.await.ok();
@@ -125,12 +153,16 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
         let Ok(inner) = Arc::try_unwrap(self.inner) else {
             panic!("Shutdown failed - not all resources are freed after main task is completed");
         };
-        inner.syncer.stop()
+        let Ok(dispatcher) = Arc::try_unwrap(inner.syncer) else {
+            panic!("Shutdown failed - CoreThreadDispatcher is still referenced elsewhere (e.g., HTTP server)");
+        };
+
+        dispatcher.stop()
     }
 
     async fn run(
         mut network: Network,
-        inner: Arc<NetworkSyncerInner<H, C>>,
+        inner: Arc<NetworkSyncerInner<H>>,
         epoch_close_signal: mpsc::Receiver<()>,
         shutdown_grace_period: Duration,
         block_fetcher: Arc<BlockFetcher>,
@@ -155,6 +187,8 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
             let authority = peer_id as AuthorityIndex;
             block_fetcher.register_authority(authority, sender).await;
 
+            inner.dkg_manager.lock().await.register_peer(authority, connection.sender.clone());
+
             let task = handle.spawn(Self::connection_task(
                 connection,
                 inner.clone(),
@@ -177,7 +211,7 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
 
     async fn connection_task(
         mut connection: Connection,
-        inner: Arc<NetworkSyncerInner<H, C>>,
+        inner: Arc<NetworkSyncerInner<H>>,
         block_fetcher: Arc<BlockFetcher>,
         metrics: Arc<Metrics>,
     ) -> Option<()> {
@@ -237,8 +271,21 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
                 NetworkMessage::BlockNotFound(_references) => {
                     // TODO: leverage this signal to request blocks from other peers
                 }
+                NetworkMessage::DkgCommitment(commits) => {
+                    inner.dkg_manager.lock().await.handle_commitment(id, commits);
+                }
+                NetworkMessage::DkgShare(share) => {
+                    inner.dkg_manager.lock().await.handle_share(id, share);
+                }
+                NetworkMessage::PartialDecryptionShare(share_bytes) => {
+                    // ❗ DkgManager 락을 잡고 *동기* 함수 호출
+                    inner.dkg_manager.lock().await
+                        .handle_partial_decryption(id, share_bytes);
+                }
             }
         }
+        inner.dkg_manager.lock().await.unregister_peer(id);
+
         inner.syncer.authority_connection(id, false).await;
         disseminator.shutdown().await;
         block_fetcher.remove_authority(id).await;
@@ -246,11 +293,13 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
     }
 
     async fn leader_timeout_task(
-        inner: Arc<NetworkSyncerInner<H, C>>,
-        mut epoch_close_signal: mpsc::Receiver<()>,
+        inner: Arc<NetworkSyncerInner<H>>,
+        mut epoch_close_signal: mpsc::Receiver<()>, // ❗ Receiver
         shutdown_grace_period: Duration,
     ) -> Option<()> {
         let leader_timeout = Duration::from_secs(1);
+        let mut tallying_started = false;
+
         loop {
             let notified = inner.notify.notified();
             let round = inner
@@ -258,38 +307,286 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
                 .last_own_block_ref()
                 .map(|b| b.round())
                 .unwrap_or_default();
+
+            let effective_leader_timeout = if tallying_started {
+                Duration::MAX
+            } else {
+                leader_timeout
+            };
+
             let closing_time = inner.epoch_closing_time.load(Ordering::Relaxed);
             let shutdown_duration = if closing_time != 0 {
-                shutdown_grace_period.saturating_sub(
-                    timestamp_utc().saturating_sub(Duration::from_millis(closing_time)),
-                )
+                let elapsed_since_close = timestamp_utc().saturating_sub(Duration::from_millis(closing_time));
+                shutdown_grace_period.saturating_sub(elapsed_since_close)
             } else {
                 Duration::MAX
             };
-            if Duration::is_zero(&shutdown_duration) {
-                return None;
-            }
+
+            // -----------------------------------------------------------------
+            // ❌ ❗ `if Duration::is_zero(...)` 블록 전체를 삭제합니다.
+            // (E0382 오류의 원인. select!가 이 경우를 자동으로 처리합니다.)
+            // -----------------------------------------------------------------
+
             select! {
-                _sleep = runtime::sleep(leader_timeout) => {
+                _sleep = runtime::sleep(effective_leader_timeout) => {
                     tracing::debug!("Timeout {round}");
-                    // todo - more then one round timeout can happen, need to fix this
                     inner.syncer.force_new_block(round).await;
                 }
-                _notified = notified => {
-                    // restart loop
+                _notified = notified, if !tallying_started => {
+                    // (FPC 블록 생성 알림) Tally 중에는 무시
                 }
-                _epoch_shutdown = runtime::sleep(shutdown_duration) => {
-                    tracing::info!("Shutting down sync after epoch close");
-                    epoch_close_signal.close();
+
+                // ❗ (핵심 트리거)
+                // shutdown_duration이 0이 되어도 이 브랜치가 즉시 실행됩니다.
+                _epoch_shutdown = runtime::sleep(shutdown_duration), if !tallying_started => {
+
+                    tracing::info!("Epoch closing grace period ended. Starting End-of-Epoch Tally Protocol.");
+                    tallying_started = true; // ❗ 집계 시작 플래그
+
+                    // ❗ Tally 태스크를 실행하고, *Sender*의 복제본을 이동시킵니다.
+                    // ❗ Receiver(`epoch_close_signal`)는 이동하지 않습니다.
+                    Handle::current().spawn(Self::run_tally_protocol(
+                        inner.clone(),
+                        inner.epoch_close_signal.clone(), // ❗ Sender 복제본을 이동
+                    ));
+
+                    // Receiver는 계속 이 태스크가 소유합니다.
                 }
+
+                // ❗ Tally가 완료되어 Sender가 drop되면, recv()가 None을 반환합니다.
+                _tally_completed = epoch_close_signal.recv() => {
+                    tracing::info!("Tally protocol completed (channel closed). Shutting down leader_timeout_task.");
+                    return None; // ❗ Tally 완료 후 종료
+                }
+
                 _stopped = inner.stopped() => {
+                    // 외부에서 Stop 신호를 받음 (Tally 완료 시에도 트리거됨)
                     return None;
                 }
             }
         }
     }
 
-    async fn cleanup_task(inner: Arc<NetworkSyncerInner<H, C>>) -> Option<()> {
+    // --- ❗ (신규) Tally 프로토콜 헬퍼 함수 ---
+    async fn run_tally_protocol( // ❗ H 제네릭 추가
+        inner: Arc<NetworkSyncerInner<H>>,
+        epoch_close_signal_sender: mpsc::Sender<()>, // ❗ Sender를 받음
+    ) {
+        // 1. Core에 모든 커밋된 트랜잭션 요청
+        let all_committed_tx_locators = inner.syncer
+            .get_all_committed_tx_locators().await;
+
+        // 2. 트랜잭션 데이터(암호문) 가져오기
+        let encrypted_votes = inner.syncer
+            .get_transactions(all_committed_tx_locators).await;
+
+        // 3. 동형암호 집계 (HE Aggregation)
+        let aggregated_ciphertext = Self::perform_he_aggregation(encrypted_votes).await;
+
+        // 4. Core에서 내 DKG 비밀 키 가져오기
+        let my_share = inner.syncer.get_my_secret_share().await
+            .expect("DKG key is not available for Tally protocol");
+
+        // 5. 부분 복호화
+        let partial_decryption = Self::perform_partial_decryption(&aggregated_ciphertext, &my_share).await;
+
+        // 6. 부분 복호화 결과 브로드캐스트
+        inner.dkg_manager.lock().await
+            .broadcast_partial_decryption(partial_decryption).await;
+
+        // 7. 2f+1개의 부분 복호화 결과 수집
+        let all_shares = inner.dkg_manager.lock().await
+            .collect_partial_decryptions().await;
+
+        // 8. 최종 복호화 (집계)
+        let final_tally_result = Self::perform_full_decryption(
+            &aggregated_ciphertext, // ❗ 1. 집계된 암호문(C2 포함)
+            all_shares              // ❗ 2. 부분 셰어 목록
+        ).await;
+
+        // 9. 결과 로깅
+        tracing::info!("--- 🏁 FINAL TALLY RESULT 🏁 ---");
+        tracing::info!("{:?}", final_tally_result);
+        tracing::info!("-----------------------------------");
+
+        // 10. ❗ 모든 작업 완료 후, *Sender*를 drop하여 채널을 닫음
+        tracing::info!("Tallying complete. Shutting down network sync.");
+        drop(epoch_close_signal_sender); // ❗ Sender를 drop
+    }
+
+    async fn perform_he_aggregation(txs: Vec<Transaction>) -> Vec<u8> {
+        spawn_blocking(move || {
+            tracing::info!("Aggregating {} encrypted transactions...", txs.len());
+
+            let mut all_ballots: Vec<Vec<ZKElgamalCiphertext>> = Vec::new();
+            let mut num_candidates = 0;
+
+            for (i, tx) in txs.iter().enumerate() {
+                // ❗ (수정) `tx.data`를 `VoteTransaction`으로 비직렬화
+                match tx.get_vote() {
+                    Ok(vote_tx) => {
+                        if i == 0 {
+                            num_candidates = vote_tx.enc_vote_vec.len();
+                            if num_candidates == 0 {
+                                tracing::warn!("Transaction 0 has no candidates, skipping aggregation.");
+                                return bincode::serialize(&Vec::<ZKElgamalCiphertext>::new()).unwrap();
+                            }
+                        } else if vote_tx.enc_vote_vec.len() != num_candidates {
+                            tracing::warn!("Ballot size mismatch! Skipping tx {}.", i);
+                            continue;
+                        }
+                        // ❗ `enc_vote_vec` (Vec<ZKElgamalCiphertext>) 추출
+                        all_ballots.push(vote_tx.enc_vote_vec);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize VoteTransaction: {}", e);
+                    }
+                }
+            }
+
+            if all_ballots.is_empty() {
+                tracing::warn!("No valid ballots found for aggregation.");
+                return bincode::serialize(&Vec::<ZKElgamalCiphertext>::new()).unwrap();
+            }
+
+            // 후보자별로 암호문 집계
+            let mut final_tallies: Vec<ZKElgamalCiphertext> = Vec::with_capacity(num_candidates);
+            for i in 0..num_candidates {
+                // ❗ `ZKElgamalCiphertext`에는 Affine 포인트가 들어있음
+                let candidate_ciphertexts: Vec<&ZKElgamalCiphertext> =
+                    all_ballots.iter().map(|b| &b[i]).collect();
+
+                // ❗ Affine 포인트를 Projective로 변환하며 합산
+                let mut c1_agg = JubJub::zero();
+                let mut c2_agg = JubJub::zero();
+                for zkc in candidate_ciphertexts {
+                    c1_agg += zkc.c1.into_group();
+                    c2_agg += zkc.c2.into_group();
+                }
+
+                final_tallies.push(ZKElgamalCiphertext {
+                    c1: c1_agg.into_affine(),
+                    c2: c2_agg.into_affine(),
+                });
+            }
+
+            tracing::info!("Aggregation complete for {} candidates.", num_candidates);
+            // ❗ `Vec<ZKElgamalCiphertext>`를 직렬화하여 반환
+            bincode::serialize(&final_tallies).unwrap()
+        })
+            .await
+            .unwrap()
+    }
+
+    async fn perform_partial_decryption(ciphertext: &[u8], share: &Fr) -> Vec<u8> {
+        let share = *share;
+        let ciphertext = ciphertext.to_vec();
+
+        spawn_blocking(move || {
+            tracing::info!("Performing partial decryption...");
+
+            // 1. 집계된 암호문(Vec<ZKElgamalCiphertext>) 비직렬화 (bincode)
+            let final_tallies: Vec<ZKElgamalCiphertext> = bincode::deserialize(&ciphertext)
+                .expect("Failed to deserialize aggregated ciphertext");
+
+            // ❗ [수정] 반환 타입은 `Vec<JubJubAffine>` (래퍼 없음)
+            let mut partial_shares: Vec<JubJubAffine> = Vec::with_capacity(final_tallies.len());
+
+            // 2. 각 후보자별로 D_i 계산
+            for zkc in final_tallies {
+                // [라이브러리 호출] D_i = s_i * C1
+                let d_i_point = elgamal::partial_decrypt_share(&zkc.c1, share);
+                partial_shares.push(d_i_point);
+            }
+
+            // 3. ❗ [수정] `Vec<JubJubAffine>`를 `ark-serialize`로 직접 직렬화
+            let mut bytes = Vec::new();
+            partial_shares.serialize_with_mode(&mut bytes, Compress::Yes)
+                .expect("Failed to serialize partial shares");
+            bytes
+        })
+            .await
+            .unwrap()
+    }
+
+    async fn perform_full_decryption(
+        aggregated_ciphertext: &[u8],
+        all_shares: Vec<(AuthorityIndex, Vec<u8>)>, // (인덱스, ark-serialized Vec<JubJubAffine>)
+    ) -> Vec<u64> {
+
+        let aggregated_ciphertext = aggregated_ciphertext.to_vec();
+
+        spawn_blocking(move || {
+            tracing::info!("Performing full decryption from {} shares...", all_shares.len());
+
+            // 1. 집계된 암호문(Vec<ZKElgamalCiphertext>) 비직렬화 (bincode)
+            let final_tallies: Vec<ZKElgamalCiphertext> = bincode::deserialize(&aggregated_ciphertext)
+                .expect("Failed to deserialize aggregated ciphertext for C2");
+
+            let num_candidates = final_tallies.len();
+            if num_candidates == 0 { return Vec::new(); }
+
+            // 2. ❗ (인덱스, `Vec<u8>`) -> (u64, `Vec<JubJubAffine>`) 비직렬화 (ark-deserialize)
+            let mut deserialized_shares: Vec<(u64, Vec<JubJubAffine>)> = Vec::new();
+            let mut chosen_indices: Vec<u64> = Vec::new();
+
+            for (index, share_vec_u8) in all_shares {
+                // ❗ [수정] `ark-deserialize`로 `Vec<JubJubAffine>` 복원
+                let partial_points: Vec<JubJubAffine> =
+                    Vec::<JubJubAffine>::deserialize_with_mode(&share_vec_u8[..], Compress::Yes, Validate::Yes)
+                        .expect("Failed to deserialize partial share");
+
+                if partial_points.len() != num_candidates {
+                    tracing::warn!("Partial share size mismatch from authority {}, skipping.", index);
+                    continue;
+                }
+
+                chosen_indices.push(index as u64);
+                deserialized_shares.push((index as u64, partial_points));
+            }
+
+            if deserialized_shares.is_empty() {
+                tracing::error!("Not enough shares to decrypt (0 < t)");
+                return Vec::new();
+            }
+
+            const MAX_VOTES_PER_CANDIDATE: u64 = 1_000_000;
+            let g = JubJubAffine::generator();
+            let mut final_counts: Vec<u64> = Vec::with_capacity(num_candidates);
+
+            // 3. 후보자별로 셰어 결합 (이후 로직은 동일)
+            for i in 0..num_candidates {
+                let c2 = final_tallies[i].c2;
+
+                let shares_for_this_candidate: Vec<(u64, JubJubAffine)> = deserialized_shares
+                    .iter()
+                    .map(|(idx, shares)| (*idx, shares[i]))
+                    .collect();
+
+                // [라이브러리 호출]
+                let decrypted_tally_point = elgamal::combine_shares_threshold(
+                    &c2,
+                    &shares_for_this_candidate,
+                    &chosen_indices,
+                );
+
+                // [헬퍼 호출]
+                let count = decode_vote(&decrypted_tally_point, &g, MAX_VOTES_PER_CANDIDATE)
+                    .unwrap_or_else(|| {
+                        tracing::error!("Failed to decode vote count for candidate {}!", i);
+                        0
+                    });
+
+                final_counts.push(count);
+            }
+
+            final_counts
+        })
+            .await
+            .unwrap()
+    }
+
+    async fn cleanup_task(inner: Arc<NetworkSyncerInner<H>>) -> Option<()> {
         let cleanup_interval = Duration::from_secs(10);
         loop {
             select! {
@@ -309,7 +606,7 @@ impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncer<H, C>
     }
 }
 
-impl<H: BlockHandler + 'static, C: CommitObserver + 'static> NetworkSyncerInner<H, C> {
+impl<H: BlockHandler + 'static> NetworkSyncerInner<H> {
     // Returns None either if channel is closed or NetworkSyncerInner receives stop signal
     async fn recv_or_stopped<T>(&self, channel: &mut mpsc::Receiver<T>) -> Option<T> {
         select! {

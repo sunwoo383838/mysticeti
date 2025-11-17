@@ -33,6 +33,7 @@ use crate::{
     stat::{histogram, DivUsize, HistogramSender, PreciseHistogram},
     types::{format_authority_index, AuthorityIndex},
 };
+use crate::nullifier::NullifierDB;
 
 const LATENCY_SEC_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 0.75, 1., 1.25, 1.5, 1.75, 2., 2.5, 3.0, 4.0, 5., 10., 20., 30., 60., 90.,
@@ -75,6 +76,7 @@ pub struct Metrics {
     pub transaction_certified_latency: HistogramSender<Duration>,
     pub certificate_committed_latency: HistogramSender<Duration>,
     pub transaction_committed_latency: HistogramSender<Duration>,
+    pub transaction_verified_latency: HistogramSender<Duration>,
 
     pub proposed_block_size_bytes: HistogramSender<usize>,
     pub proposed_block_transaction_count: HistogramSender<usize>,
@@ -84,6 +86,12 @@ pub struct Metrics {
 
     pub utilization_timer: IntCounterVec,
     pub submitted_transactions: IntCounter,
+
+    pub mempool_unverified_transactions: IntGauge,
+    pub mempool_verified_transactions: IntGauge,
+    pub mempool_transactions_processed_total: IntCounterVec,
+
+    pub nullifier_db_size: IntGauge,
 }
 
 pub struct MetricReporter {
@@ -92,6 +100,7 @@ pub struct MetricReporter {
     pub transaction_certified_latency: HistogramReporter<Duration>,
     pub certificate_committed_latency: HistogramReporter<Duration>,
     pub transaction_committed_latency: HistogramReporter<Duration>,
+    pub transaction_verified_latency: HistogramReporter<Duration>,
 
     pub proposed_block_size_bytes: HistogramReporter<usize>,
     pub proposed_block_transaction_count: HistogramReporter<usize>,
@@ -118,6 +127,7 @@ impl Metrics {
         let (transaction_certified_latency_hist, transaction_certified_latency) = histogram();
         let (certificate_committed_latency_hist, certificate_committed_latency) = histogram();
         let (transaction_committed_latency_hist, transaction_committed_latency) = histogram();
+        let (transaction_verified_latency_hist, transaction_verified_latency) = histogram();
 
         let (proposed_block_size_bytes_hist, proposed_block_size_bytes) = histogram();
         let (proposed_block_transaction_count_hist, proposed_block_transaction_count) = histogram();
@@ -151,6 +161,11 @@ impl Metrics {
                 transaction_committed_latency_hist,
                 registry,
                 "transaction_committed_latency",
+            ),
+            transaction_verified_latency: HistogramReporter::new_in_registry(
+                transaction_verified_latency_hist,
+                registry,
+                "transaction_verified_latency"
             ),
 
             proposed_block_size_bytes: HistogramReporter::new_in_registry(
@@ -195,7 +210,7 @@ impl Metrics {
                 "Duration of the benchmark",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             latency_s: register_histogram_vec_with_registry!(
                 LATENCY_S,
                 "Buckets measuring the end-to-end latency of a workload in seconds",
@@ -203,21 +218,21 @@ impl Metrics {
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             latency_squared_s: register_counter_vec_with_registry!(
                 LATENCY_SQUARED_S,
                 "Square of total end-to-end latency of a workload in seconds",
                 &["workload"],
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             committed_leaders_total: register_int_counter_vec_with_registry!(
                 "committed_leaders_total",
                 "Total number of (direct or indirect) committed leaders per authority",
                 &["authority", "commit_type"],
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             inter_block_latency_s: register_histogram_vec_with_registry!(
                 "inter_block_latency_s",
                 "Buckets measuring the inter-block latency in seconds",
@@ -230,84 +245,84 @@ impl Metrics {
                 "Total number of submitted transactions",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             leader_timeout_total: register_int_counter_with_registry!(
                 "leader_timeout_total",
                 "Total number of leader timeouts",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
 
             block_store_loaded_blocks: register_int_counter_with_registry!(
                 "block_store_loaded_blocks",
                 "Blocks loaded from wal position in the block store",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             block_store_unloaded_blocks: register_int_counter_with_registry!(
                 "block_store_unloaded_blocks",
                 "Blocks unloaded from wal position during cleanup",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             block_store_entries: register_int_counter_with_registry!(
                 "block_store_entries",
                 "Number of entries in block store",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             block_store_cleanup_util: register_int_counter_with_registry!(
                 "block_store_cleanup_util",
                 "block_store_cleanup_util",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
 
             wal_mappings: register_int_gauge_with_registry!(
                 "wal_mappings",
                 "Number of mappings retained by the wal",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
 
             core_lock_util: register_int_counter_with_registry!(
                 "core_lock_util",
                 "Utilization of core write lock",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             core_lock_enqueued: register_int_counter_with_registry!(
                 "core_lock_enqueued",
                 "Number of enqueued core requests",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             core_lock_dequeued: register_int_counter_with_registry!(
                 "core_lock_dequeued",
                 "Number of dequeued core requests",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
 
             block_handler_pending_certificates: register_int_gauge_with_registry!(
                 "block_handler_pending_certificates",
                 "Number of pending certificates in block handler",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             block_handler_cleanup_util: register_int_counter_with_registry!(
                 "block_handler_cleanup_util",
                 "block_handler_cleanup_util",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
 
             commit_handler_pending_certificates: register_int_gauge_with_registry!(
                 "commit_handler_pending_certificates",
                 "Number of pending certificates in commit handler",
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
 
             missing_blocks: register_int_gauge_vec_with_registry!(
                 "missing_blocks",
@@ -315,21 +330,21 @@ impl Metrics {
                 &["authority"],
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             block_sync_requests_sent: register_int_counter_vec_with_registry!(
                 "block_sync_requests_sent",
                 "Number of block sync requests sent per authority",
                 &["authority"],
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
             block_sync_requests_received: register_int_counter_vec_with_registry!(
                 "block_sync_requests_received",
                 "Number of block sync requests received per authority and whether they have been fulfilled",
                 &["authority", "fulfilled"],
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
 
             utilization_timer: register_int_counter_vec_with_registry!(
                 "utilization_timer",
@@ -337,11 +352,37 @@ impl Metrics {
                 &["proc"],
                 registry,
             )
-            .unwrap(),
+                .unwrap(),
+
+            mempool_unverified_transactions: register_int_gauge_with_registry!(
+                "mempool_unverified_transactions",
+                "Number of transactions currently in the unverified bool",
+                registry
+            ).unwrap(),
+
+            mempool_verified_transactions: register_int_gauge_with_registry!(
+                "mempool_verified_transactions",
+                "Number of transactions currently in the verified pool (ready for proposal)",
+                registry
+            ).unwrap(),
+
+            mempool_transactions_processed_total: register_int_counter_vec_with_registry!(
+                "mempool_transactions_processed_total",
+                "Total number of transactions processed by the mempool, by status",
+                &["status"],
+                registry
+            ).unwrap(),
+
+            nullifier_db_size: register_int_gauge_with_registry!(
+                "nullifier_db_size",
+                "Total number of nullifiers in the NullifierDB",
+                registry
+            ).unwrap(),
 
             transaction_certified_latency,
             certificate_committed_latency,
             transaction_committed_latency,
+            transaction_verified_latency,
 
             proposed_block_size_bytes,
             proposed_block_transaction_count,
@@ -458,6 +499,7 @@ impl MetricReporter {
         self.transaction_certified_latency.clear_receive_all();
         self.certificate_committed_latency.clear_receive_all();
         self.transaction_committed_latency.clear_receive_all();
+        self.transaction_verified_latency.clear_receive_all();
 
         self.proposed_block_size_bytes.clear_receive_all();
         self.proposed_block_transaction_count.clear_receive_all();
@@ -488,6 +530,7 @@ impl MetricReporter {
         self.transaction_certified_latency.report();
         self.certificate_committed_latency.report();
         self.transaction_committed_latency.report();
+        self.transaction_verified_latency.report();
 
         self.proposed_block_size_bytes.report();
         self.proposed_block_transaction_count.report();

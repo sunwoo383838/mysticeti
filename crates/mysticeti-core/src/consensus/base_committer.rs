@@ -244,16 +244,13 @@ impl BaseCommitter {
     ) -> bool {
         let decision_blocks = self.block_store.get_blocks_by_round(decision_round);
 
-        let mut certificate_stake_aggregator = StakeAggregator::<QuorumThreshold>::new();
         for decision_block in &decision_blocks {
             let authority = decision_block.reference().authority;
             if self.is_certificate(decision_block, leader_block) {
                 tracing::trace!(
                     "[{self}] {decision_block:?} is a certificate for leader {leader_block:?}"
                 );
-                if certificate_stake_aggregator.add(authority, &self.committee) {
-                    return true;
-                }
+                return true;
             }
         }
         false

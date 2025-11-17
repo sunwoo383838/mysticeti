@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{cmp::min, sync::Arc, time::Duration};
-
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::Read;
+use eyre::Context;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use tokio::sync::mpsc;
 
@@ -16,7 +19,7 @@ use crate::{
 
 pub struct TransactionGenerator {
     sender: mpsc::Sender<Vec<Transaction>>,
-    rng: StdRng,
+    transactions: VecDeque<Transaction>,
     client_parameters: ClientParameters,
     node_public_config: NodePublicConfig,
     metrics: Arc<Metrics>,
@@ -32,16 +35,31 @@ impl TransactionGenerator {
         node_public_config: NodePublicConfig,
         metrics: Arc<Metrics>,
     ) {
-        assert!(client_parameters.transaction_size > 8 + 8); // 8 bytes timestamp + 8 bytes random
-        tracing::info!(
-            "Starting generator with {} transactions per second, initial delay {:?}",
-            client_parameters.load,
-            client_parameters.initial_delay
-        );
+        let file_path = format!("validator_{}_txs.bin", seed);
+        let transactions = match File::open(&file_path) {
+            Ok(mut file) => {
+                tracing::info!("Loading transactions from default file: {}", file_path);
+                let mut buffer = Vec::new();
+                file.read_to_end(&mut buffer)
+                    .context(format!("Failed to read transaction file: {}", file_path))
+                    .expect("Cannot read transaction file. Exiting.");
+                let txs: Vec<Transaction> = bincode::deserialize(&buffer)
+                    .context(format!("Failed to deserialize transactions from '{}'. File is corrupt.", file_path))
+                    .expect("Cannot deserialize transaction file. Exiting.");
+                tracing::info!("Loaded {} transactions from {}.", txs.len(), file_path);
+                txs.into()
+            }
+            Err(e) => {
+                panic!(
+                    "Failed to open transaction file '{}': {}. Cannot continue.",
+                    file_path, e
+                )
+            }
+        };
         runtime::Handle::current().spawn(
             Self {
                 sender,
-                rng: StdRng::seed_from_u64(seed),
+                transactions,
                 client_parameters,
                 node_public_config,
                 metrics,
@@ -51,57 +69,47 @@ impl TransactionGenerator {
     }
 
     pub async fn run(mut self) {
+
         let load = self.client_parameters.load;
         let transactions_per_block_interval = (load + 9) / 10;
-        tracing::info!(
-            "Generating {transactions_per_block_interval} transactions per {} ms",
-            Self::TARGET_BLOCK_INTERVAL.as_millis()
-        );
-        let max_block_size = self.node_public_config.parameters.max_block_size;
-        let target_block_size = min(max_block_size, transactions_per_block_interval);
-
-        let mut counter = 0;
-        let mut tx_to_report = 0;
-        let mut random: u64 = self.rng.gen(); // 8 bytes
-        let zeros = vec![0u8; self.client_parameters.transaction_size - 8 - 8]; // 8 bytes timestamp + 8 bytes random
 
         let mut interval = runtime::TimeInterval::new(Self::TARGET_BLOCK_INTERVAL);
         runtime::sleep(self.client_parameters.initial_delay).await;
+
+        tracing::info!("Sending loaded transactions at {} TPS...", load);
+
         loop {
             interval.tick().await;
-            let timestamp = (timestamp_utc().as_millis() as u64).to_le_bytes();
 
-            let mut block = Vec::with_capacity(target_block_size);
-            let mut block_size = 0;
+            let mut total_sent_in_batch = 0;
+            if self.transactions.is_empty() {
+                tracing::info!("Finished sending all loaded transactions.");
+                self.metrics.submitted_transactions.inc_by(total_sent_in_batch);
+                runtime::sleep(Duration::from_secs(600)).await;
+                continue;
+            }
+
+            let mut block= Vec::with_capacity(transactions_per_block_interval);
+
             for _ in 0..transactions_per_block_interval {
-                random += counter;
-
-                let mut transaction = Vec::with_capacity(self.client_parameters.transaction_size);
-                transaction.extend_from_slice(&timestamp); // 8 bytes
-                transaction.extend_from_slice(&random.to_le_bytes()); // 8 bytes
-                transaction.extend_from_slice(&zeros[..]);
-
-                block.push(Transaction::new(transaction));
-                block_size += self.client_parameters.transaction_size;
-                counter += 1;
-                tx_to_report += 1;
-
-                if block_size >= max_block_size {
-                    if self.sender.send(block.clone()).await.is_err() {
-                        return;
-                    }
-                    block.clear();
-                    block_size = 0;
+                if let Some(tx) = self.transactions.pop_front() {
+                    block.push(tx);
+                    total_sent_in_batch += 1;
+                } else {
+                    break;
                 }
             }
 
-            if !block.is_empty() && self.sender.send(block).await.is_err() {
-                return;
+            if !block.is_empty() {
+                if self.sender.send(block).await.is_err() {
+                    tracing::warn!("Sender channel closed, stopping transaction generator.");
+                    return;
+                }
             }
 
-            if counter % 10_000 == 0 {
-                self.metrics.submitted_transactions.inc_by(tx_to_report);
-                tx_to_report = 0
+            if total_sent_in_batch >= 10_000 {
+                self.metrics.submitted_transactions.inc_by(total_sent_in_batch);
+                total_sent_in_batch = 0;
             }
         }
     }

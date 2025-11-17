@@ -6,7 +6,9 @@ use std::{
     mem,
     sync::{atomic::AtomicU64, Arc},
 };
-
+use std::collections::HashMap;
+use ark_ed_on_bls12_381::Fr;
+use tokio::sync::{Mutex, Notify};
 use minibytes::Bytes;
 
 use crate::{
@@ -37,6 +39,11 @@ use crate::{
     types::{AuthorityIndex, BaseStatement, BlockReference, RoundNumber, StatementBlock},
     wal::{WalPosition, WalSyncer, WalWriter},
 };
+use crate::block_handler::CommitHandler;
+use crate::committee::{QuorumThreshold, StakeAggregator};
+use crate::dkg_manager::DkgManager;
+use crate::finalization_interpreter::FinalizationInterpreter;
+use crate::types::TransactionLocator;
 
 pub struct Core<H: BlockHandler> {
     block_manager: BlockManager,
@@ -57,6 +64,14 @@ pub struct Core<H: BlockHandler> {
     epoch_manager: EpochManager,
     rounds_in_epoch: RoundNumber,
     committer: UniversalCommitter,
+    commit_handler: CommitHandler,
+    fpc_transaction_aggregator:
+        HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
+    fpc_certificate_aggregator:
+        HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>,
+    dkg_manager: Arc<Mutex<DkgManager>>,
+    dkg_complete_notify: Arc<Notify>,
+    my_secret_share: Arc<Mutex<Option<Fr>>>,
 }
 
 pub struct CoreOptions {
@@ -81,6 +96,10 @@ impl<H: BlockHandler> Core<H> {
         recovered: RecoveredState,
         mut wal_writer: WalWriter,
         options: CoreOptions,
+        commit_handler: CommitHandler,
+        dkg_manager: Arc<Mutex<DkgManager>>,
+        dkg_complete_notify: Arc<Notify>,
+        my_secret_share: Arc<Mutex<Option<Fr>>>,
     ) -> Self {
         let RecoveredState {
             block_store,
@@ -162,6 +181,12 @@ impl<H: BlockHandler> Core<H> {
             epoch_manager,
             rounds_in_epoch: public_config.parameters.rounds_in_epoch,
             committer,
+            commit_handler,
+            fpc_transaction_aggregator: Default::default(),
+            fpc_certificate_aggregator: Default::default(),
+            dkg_manager,
+            dkg_complete_notify,
+            my_secret_share,
         };
 
         if !unprocessed_blocks.is_empty() {
@@ -169,6 +194,17 @@ impl<H: BlockHandler> Core<H> {
                 "Replaying {} blocks for transaction aggregator",
                 unprocessed_blocks.len()
             );
+
+            for block in &unprocessed_blocks {
+                let mut fpc = FinalizationInterpreter::new(
+                    &this.block_store,
+                    this.committee.clone(),
+                    &mut this.commit_handler,
+                    &mut this.fpc_transaction_aggregator,
+                    &mut this.fpc_certificate_aggregator,
+                );
+                fpc.process_block(block);
+            }
             this.run_block_handler(&unprocessed_blocks);
         }
 
@@ -190,16 +226,48 @@ impl<H: BlockHandler> Core<H> {
             .block_manager
             .add_blocks(blocks, &mut (&mut self.wal_writer, &self.block_store));
         let mut result = Vec::with_capacity(processed.len());
-        for (position, processed) in processed.into_iter() {
+        for (position, block) in processed.into_iter() {
             self.threshold_clock
-                .add_block(*processed.reference(), &self.committee);
+                .add_block(*block.reference(), &self.committee);
             self.pending
-                .push_back((position, MetaStatement::Include(*processed.reference())));
-            result.push(processed);
+                .push_back((position, MetaStatement::Include(*block.reference())));
+            let mut interpreter = FinalizationInterpreter::new(
+                &self.block_store,
+                self.committee.clone(),
+                &mut self.commit_handler,
+                &mut self.fpc_transaction_aggregator,
+                &mut self.fpc_certificate_aggregator,
+            );
+            interpreter.process_block(&block);
+            result.push(block);
         }
         self.run_block_handler(&result);
         result
     }
+
+    pub fn commit_handler_mut(&mut self) -> &mut CommitHandler {
+        &mut self.commit_handler
+    }
+
+    pub fn commit_handler(&self) -> &CommitHandler {
+        &self.commit_handler
+    }
+
+    pub fn epoch_manager_mut(&mut self) -> &mut EpochManager {
+        &mut self.epoch_manager
+    }
+
+    // ❗ 2. Tally 프로토콜을 위해 DKG 키에 접근
+    pub async fn get_my_secret_share(&self) -> Option<Fr> {
+        self.my_secret_share.lock().await.clone()
+    }
+
+    // ❗ 3. Tally 프로토콜을 위해 DkgManager에 접근
+    pub fn get_dkg_manager(&self) -> Arc<Mutex<DkgManager>> {
+        self.dkg_manager.clone()
+    }
+
+
 
     fn run_block_handler(&mut self, processed: &[Data<StatementBlock>]) {
         let _timer = self
@@ -441,12 +509,6 @@ impl<H: BlockHandler> Core<H> {
         self.wal_writer
             .write(WAL_ENTRY_COMMIT, &commits)
             .expect("Write to wal has failed");
-    }
-
-    pub fn take_recovered_committed_blocks(&mut self) -> (HashSet<BlockReference>, Option<Bytes>) {
-        self.recovered_committed_blocks
-            .take()
-            .expect("take_recovered_committed_blocks called twice")
     }
 
     pub fn block_store(&self) -> &BlockStore {

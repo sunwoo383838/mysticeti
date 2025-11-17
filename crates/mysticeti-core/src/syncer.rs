@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{collections::HashSet, sync::Arc};
-
+use std::marker::PhantomData;
 use minibytes::Bytes;
 
 use crate::{
@@ -15,13 +15,13 @@ use crate::{
     runtime::timestamp_utc,
     types::{AuthorityIndex, BlockReference, RoundNumber, StatementBlock},
 };
+use crate::block_handler::CommitHandler;
 
-pub struct Syncer<H: BlockHandler, S: SyncerSignals, C: CommitObserver> {
+pub struct Syncer<H: BlockHandler, S: SyncerSignals> {
     core: Core<H>,
     force_new_block: bool,
     commit_period: u64,
     signals: S,
-    commit_observer: C,
     pub(crate) connected_authorities: HashSet<AuthorityIndex>,
     metrics: Arc<Metrics>,
 }
@@ -42,12 +42,11 @@ pub trait CommitObserver: Send + Sync {
     fn recover_committed(&mut self, committed: HashSet<BlockReference>, state: Option<Bytes>);
 }
 
-impl<H: BlockHandler, S: SyncerSignals, C: CommitObserver> Syncer<H, S, C> {
+impl<H: BlockHandler, S: SyncerSignals> Syncer<H, S> {
     pub fn new(
         core: Core<H>,
         commit_period: u64,
         signals: S,
-        commit_observer: C,
         metrics: Arc<Metrics>,
     ) -> Self {
         let committee_size = core.committee().len();
@@ -56,7 +55,6 @@ impl<H: BlockHandler, S: SyncerSignals, C: CommitObserver> Syncer<H, S, C> {
             force_new_block: false,
             commit_period,
             signals,
-            commit_observer,
             connected_authorities: HashSet::with_capacity(committee_size),
             metrics,
         }
@@ -116,22 +114,46 @@ impl<H: BlockHandler, S: SyncerSignals, C: CommitObserver> Syncer<H, S, C> {
                     .collect();
                 tracing::debug!("Committed {:?}", committed_refs);
             }
-            let committed_subdag = self
-                .commit_observer
-                .handle_commit(self.core.block_store(), newly_committed);
+            let block_store_clone = self.core.block_store().clone();
+
+            // 2. 명시적인 스코프({})를 사용하여 commit_handler의 가변 대여(mutable borrow) 범위를 제한합니다.
+            let (committed_subdag, aggregator_state) = {
+                let commit_handler = self.core.commit_handler_mut();
+
+                // 3. C-Path 폴백 실행 (클론된 block_store 사용)
+                let committed_subdag = commit_handler
+                    .handle_commit(&block_store_clone, newly_committed);
+
+                // 4. C-Path 상태 가져오기
+                let aggregator_state = commit_handler.aggregator_state();
+
+                (committed_subdag, aggregator_state)
+            };
+            // 5. 이 지점에서 `commit_handler`의 가변 대여가 해제됩니다.
+
+            // 6. 이제 self.core를 다시 안전하게 가변 대여할 수 있습니다.
             self.core.handle_committed_subdag(
                 committed_subdag,
-                &self.commit_observer.aggregator_state(),
+                &aggregator_state,
             );
         }
     }
 
-    pub fn commit_observer(&self) -> &C {
-        &self.commit_observer
+    pub fn commit_observer_mut(&mut self) -> &mut CommitHandler {
+        self.core.commit_handler_mut()
     }
+
+    pub fn commit_observer(&self) -> &CommitHandler {
+        self.core.commit_handler()
+    }
+
 
     pub fn core(&self) -> &Core<H> {
         &self.core
+    }
+
+    pub fn core_mut(&mut self) -> &mut Core<H> { // ❗ 테스트 코드(simulator)에서 필요
+        &mut self.core
     }
 
     #[cfg(test)]
@@ -154,9 +176,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        block_handler::{TestBlockHandler, TestCommitHandler},
+        // ❗ TestCommitHandler -> CommitHandler
+        block_handler::{TestBlockHandler, CommitHandler},
         data::Data,
         simulator::{Scheduler, Simulator, SimulatorState},
+        // ❗ committee_and_syncers 헬퍼 함수도 수정 필요
         test_util::{check_commits, committee_and_syncers, rng_at_seed},
     };
 
@@ -168,7 +192,10 @@ mod tests {
         DeliverBlock(Data<StatementBlock>),
     }
 
-    impl SimulatorState for Syncer<TestBlockHandler, bool, TestCommitHandler> {
+    // -----------------------------------------------------------------
+    // ❌ C 제네릭 제거
+    // -----------------------------------------------------------------
+    impl SimulatorState for Syncer<TestBlockHandler, bool> {
         type Event = SyncerEvent;
 
         fn handle_event(&mut self, event: Self::Event) {
@@ -219,6 +246,7 @@ mod tests {
     pub fn test_syncer_at(seed: u64) {
         eprintln!("Seed {seed}");
         let rng = rng_at_seed(seed);
+        // ❗ committee_and_syncers가 C 제네릭 없는 Syncer를 반환하도록 수정되어야 함
         let (committee, syncers) = committee_and_syncers(4);
         let mut simulator = Simulator::new(syncers, rng);
 
@@ -242,7 +270,8 @@ mod tests {
             // todo - we might want to wait for exactly num_txn from each authority, rather then num_txn as usize * committee.len() total
             if await_transactions.len() < await_num_txn {
                 for state in simulator.states_mut() {
-                    await_transactions.extend(state.core.block_handler_mut().proposed.drain(..))
+                    // ❗ core_mut() 사용
+                    await_transactions.extend(state.core_mut().block_handler_mut().proposed.drain(..))
                 }
                 continue;
             }

@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = [ "crates/crypto", "crates/data-generator",
     "crates/mysticeti",
     "crates/mysticeti-core",
     "crates/orchestrator",

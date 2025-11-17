@@ -6,7 +6,7 @@ use std::{
     fs,
     path::PathBuf,
 };
-
+use std::time::Duration;
 use tokio::time::{self, Instant};
 
 use crate::{
@@ -600,6 +600,10 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
                 latest_committee_size = parameters.nodes;
             }
 
+
+            // ❗ (신규) 노드 목록을 미리 가져옵니다 (종료 신호를 보내기 위해)
+            let (clients, nodes, _) = self.select_instances(&parameters)?;
+
             // Deploy the validators.
             self.run_nodes(&parameters).await?;
             if parameters.settings.benchmark_duration.as_secs() == 0 {
@@ -609,8 +613,41 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             // Deploy the load generators.
             self.run_clients(&parameters).await?;
 
-            // Wait for the benchmark to terminate. Then save the results and print a summary.
-            let aggregator = self.run(&parameters).await?;
+            // 1. 실제 벤치마크 시간 (예: 3분)
+            let benchmark_duration = parameters.settings.benchmark_duration;
+
+            // 2. 벤치마크 종료 후, 노드가 동기화하고 Tally 프로토콜을 실행할 추가 시간
+            //    (이 값은 settings.yml에 추가하는 것이 좋습니다)
+            let tally_grace_period = Duration::from_secs(60); // 예: 1분
+
+            // 3. 오케스트레이터가 메트릭을 수집하며 기다릴 총 시간 (예: 4분)
+            let total_orchestrator_wait = benchmark_duration + tally_grace_period;
+
+            // 4. (신규) 3분 뒤에 노드에 "우아한 종료" 신호를 보낼 별도 태스크 실행
+            let ssh_manager_clone = self.ssh_manager.clone();
+            let nodes_clone = nodes.clone();
+            tokio::spawn(async move {
+                // 1. 실제 벤치마크 시간(3분)만큼 대기
+                tokio::time::sleep(benchmark_duration).await;
+
+                // 2. 모든 노드에 "우아한 종료" 신호 전송
+                //    (이 엔드포인트는 validator.rs에 구현되어 있어야 함)
+                display::action("Benchmark duration elapsed. Triggering graceful shutdown on nodes...");
+                let command = "curl -s http://127.0.0.1:10000/trigger_epoch_close";
+                let context = CommandContext::default();
+                if let Err(e) = ssh_manager_clone.execute(nodes_clone, command, context).await {
+                    display::warn(format!("Failed to send graceful shutdown trigger: {}", e));
+                }
+                display::done();
+            });
+
+            // 5. (수정) `self.run`이 총 4분(total_orchestrator_wait)을 기다리도록
+            //    파라미터를 복제하여 수정합니다.
+            let mut run_parameters = parameters.clone();
+            run_parameters.settings.benchmark_duration = total_orchestrator_wait;
+
+            // `run` 함수가 4분 동안 메트릭을 수집
+            let aggregator = self.run(&run_parameters).await?;
             aggregator.display_summary();
 
             // Kill the nodes and clients (without deleting the log files).

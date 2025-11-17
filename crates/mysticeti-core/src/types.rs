@@ -3,10 +3,12 @@
 
 pub type AuthorityIndex = u64;
 
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Transaction {
     data: Vec<u8>,
 }
+
+pub type TransactionID = [u8; 32];
 
 pub type RoundNumber = u64;
 pub type BlockDigest = crate::crypto::BlockDigest;
@@ -24,6 +26,7 @@ use std::{
 use digest::Digest;
 use eyre::{bail, ensure};
 use serde::{Deserialize, Serialize};
+use crypto::types::VoteTransaction;
 #[cfg(test)]
 pub use test::Dag;
 
@@ -476,7 +479,7 @@ impl AuthoritySet {
     }
 
     pub fn present(&self) -> impl Iterator<Item = AuthorityIndex> + '_ {
-        (0..128).filter(|bit| (self.0 & 1 << bit) != 0)
+        (0..128).filter(|bit| (self.0 & (1u128 << *bit)) != 0)
     }
 
     #[inline]
@@ -616,6 +619,15 @@ impl fmt::Display for BaseStatement {
 impl Transaction {
     pub fn new(data: Vec<u8>) -> Self {
         Self { data }
+    }
+
+    pub fn new_vote(vote_tx: &VoteTransaction) -> Result<Self, bincode::Error> {
+        let serialized_data = bincode::serialize(vote_tx)?;
+        Ok(Self { data: serialized_data })
+    }
+
+    pub fn get_vote(&self) -> Result<VoteTransaction, bincode::Error> {
+        bincode::deserialize(&self.data)
     }
 
     #[allow(dead_code)]

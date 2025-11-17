@@ -44,3 +44,6 @@ mod transactions_generator;
 pub mod types;
 pub mod validator;
 mod wal;
+mod mempool;
+mod nullifier;
+mod dkg_manager;

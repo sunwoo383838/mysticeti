@@ -7,27 +7,17 @@ use std::{
 };
 
 use ::prometheus::Registry;
+use ark_ed_on_bls12_381::{EdwardsAffine, Fr};
 use eyre::{eyre, Context, Result};
-
-use crate::{
-    block_handler::{RealBlockHandler, TestCommitHandler},
-    block_store::BlockStore,
-    committee::Committee,
-    config::{ClientParameters, NodePrivateConfig, NodePublicConfig},
-    core::{Core, CoreOptions},
-    log::TransactionLog,
-    metrics::Metrics,
-    net_sync::NetworkSyncer,
-    network::Network,
-    prometheus,
-    runtime::{JoinError, JoinHandle},
-    transactions_generator::TransactionGenerator,
-    types::AuthorityIndex,
-    wal::{self, walf},
-};
+use tokio::sync::{Mutex, Notify};
+use crate::{block_handler, block_handler::{RealBlockHandler, CommitHandler}, block_store::BlockStore, committee::Committee, config::{ClientParameters, NodePrivateConfig, NodePublicConfig}, core::{Core, CoreOptions}, log::TransactionLog, metrics::Metrics, net_sync::NetworkSyncer, network::Network, prometheus, runtime::{JoinError, JoinHandle}, transactions_generator::TransactionGenerator, types::AuthorityIndex, wal::{self, walf}};
+use crate::config::CryptoConfig;
+use crate::dkg_manager::DkgManager;
+use crate::mempool::Mempool;
+use crate::nullifier::NullifierDB;
 
 pub struct Validator {
-    network_synchronizer: NetworkSyncer<RealBlockHandler, TestCommitHandler<TransactionLog>>,
+    network_synchronizer: NetworkSyncer<RealBlockHandler>,
     metrics_handle: JoinHandle<Result<(), hyper::Error>>,
 }
 
@@ -38,6 +28,7 @@ impl Validator {
         public_config: NodePublicConfig,
         private_config: NodePrivateConfig,
         client_parameters: ClientParameters,
+        crypto_config: CryptoConfig,
     ) -> Result<Self> {
         let network_address = public_config
             .network_address(authority)
@@ -73,32 +64,51 @@ impl Validator {
             &committee,
         );
 
+        // 🌟 1. (신규) NullifierDB 생성
+        let nullifier_db = Arc::new(NullifierDB::new(metrics.clone())
+            .expect("Failed to open NullifierDB"));
+
+        // 🌟 2. (신규) Mempool 생성
+        // TransactionGenerator가 트랜잭션을 보낼 Sender(tx_sender_for_generator)와
+        // Mempool의 dispatch_loop 태스크 핸들(mempool_handle)을 반환받습니다.
+        let (mempool, tx_sender_for_generator, mempool_handle) = Mempool::new(
+            &public_config.parameters,
+            metrics.clone(),
+            nullifier_db.clone(),
+            crypto_config.clone(),   // 🌟 crypto_config 전달
+        );
+
         // Boot the validator node.
-        let (block_handler, block_sender) = RealBlockHandler::new(
+        let block_handler = RealBlockHandler::new(
             committee.clone(),
             authority,
             &private_config.certified_transactions_log(),
             recovered.block_store.clone(),
             metrics.clone(),
+            mempool.clone(),
             public_config.parameters.consensus_only,
         );
 
-        TransactionGenerator::start(
-            block_sender,
-            authority,
-            client_parameters,
-            public_config.clone(),
-            metrics.clone(),
-        );
         let committed_transaction_log =
             TransactionLog::start(private_config.committed_transactions_log())
                 .expect("Failed to open committed transaction log for write");
-        let commit_handler = TestCommitHandler::new_with_handler(
+        let commit_handler = CommitHandler::new(
             committee.clone(),
             block_handler.transaction_time.clone(),
             metrics.clone(),
+            nullifier_db.clone(),
             committed_transaction_log,
         );
+
+        let dkg_complete_notify = Arc::new(Notify::new());
+        let my_secret_share = Arc::new(Mutex::new(Option::<Fr>::None));
+
+        let dkg_manager = Arc::new(Mutex::new(DkgManager::new(
+            authority,
+            committee.clone(),
+            dkg_complete_notify.clone(),
+            &crypto_config,
+        )));
         let core = Core::open(
             block_handler,
             authority,
@@ -109,6 +119,10 @@ impl Validator {
             recovered,
             wal_writer,
             CoreOptions::default(),
+            commit_handler,
+            dkg_manager.clone(), // ❗ 전달
+            dkg_complete_notify.clone(), // ❗ 전달
+            my_secret_share.clone(), // ❗ 전달
         );
         let network = Network::load(
             &public_config,
@@ -117,14 +131,65 @@ impl Validator {
             metrics.clone(),
         )
         .await;
+
         let network_synchronizer = NetworkSyncer::start(
             network,
             core,
             public_config.parameters.wave_length,
-            commit_handler,
             public_config.parameters.shutdown_grace_period,
-            metrics,
+            metrics.clone(),
             &public_config,
+            dkg_manager.clone(),
+        );
+
+        let core_syncer_handle = network_synchronizer.core_syncer_handle(); // CoreThreadDispatcher 핸들 복제
+        let shutdown_listen_addr = "127.0.0.1:10000".parse().unwrap();
+
+        let shutdown_server_handle = tokio::spawn(async move { // ❗ (A) 바깥쪽 태스크 (소유권 O)
+            let app = axum::Router::new().route(
+                "/trigger_epoch_close",
+                // ❗❗❗ [수정] 여기에 "move" 키워드 추가 ❗❗❗
+                axum::routing::get(move || async move { // ❗ (B) 안쪽 클로저 (소유권 O)
+                    tracing::info!("Received external trigger for epoch close!");
+
+                    // core_syncer_handle은 이제 이 클로저가 소유함
+                    core_syncer_handle.trigger_epoch_change_begun().await;
+
+                    "Epoch change triggered"
+                }),
+            );
+            axum::Server::bind(&shutdown_listen_addr)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        // --- (7) (신규) DKG 프로토콜 실행 ---
+        tracing::info!("[Validator {authority}] 노드 시작. DKG를 위해 모든 피어 연결 대기 중...");
+
+        // 🔽 (신규) 모든 피어(n-1)가 연결될 때까지 대기
+        network_synchronizer.wait_for_all_peers(committee.len()).await;
+
+        tracing::info!("[Validator {authority}] 모든 피어 연결 완료. DKG 프로토콜 시작...");
+
+        // 🔽 DKG 매니저에게 DKG 시작 명령 (1단계: 커밋 브로드캐스트 시작)
+        dkg_manager.lock().await.start_dkg().await;
+
+        // 🔽 DKG 매니저가 완료 신호를 줄 때까지 대기
+        dkg_complete_notify.notified().await;
+
+        // 🔽 DKG 결과(키)를 로컬에 저장
+        let (_, sk) = dkg_manager.lock().await.get_keys().expect("DKG failed or keys not set");
+        *my_secret_share.lock().await = Some(sk);
+
+        tracing::info!("[Validator {authority}] DKG 완료. 마스터 공개키 저장됨.");
+
+        TransactionGenerator::start(
+            tx_sender_for_generator,
+            authority,
+            client_parameters,
+            public_config.clone(),
+            metrics.clone(),
         );
 
         tracing::info!("Validator {authority} listening on {network_address}");
@@ -167,6 +232,7 @@ mod smoke_tests {
         prometheus,
         types::AuthorityIndex,
     };
+    use crate::config::CryptoConfig;
 
     /// Check whether the validator specified by its metrics address has committed at least once.
     async fn check_commit(address: &SocketAddr) -> Result<bool, reqwest::Error> {
@@ -196,6 +262,7 @@ mod smoke_tests {
         let committee = Committee::new_for_benchmarks(committee_size);
         let public_config = NodePublicConfig::new_for_tests(committee_size).with_port_offset(0);
         let client_parameters = ClientParameters::default();
+        let crypto_config = CryptoConfig::default();
 
         let mut handles = Vec::new();
         let dir = TempDir::new("validator_commit").unwrap();
@@ -213,6 +280,7 @@ mod smoke_tests {
                 public_config.clone(),
                 private_config,
                 client_parameters.clone(),
+                crypto_config.clone(),
             )
             .await
             .unwrap();
@@ -238,6 +306,8 @@ mod smoke_tests {
         let committee = Committee::new_for_benchmarks(committee_size);
         let public_config = NodePublicConfig::new_for_tests(committee_size).with_port_offset(100);
         let client_parameters = ClientParameters::default();
+        let crypto_config = CryptoConfig::default();
+
 
         let mut handles = Vec::new();
         let dir = TempDir::new("validator_sync").unwrap();
@@ -258,6 +328,7 @@ mod smoke_tests {
                 public_config.clone(),
                 private_config,
                 client_parameters.clone(),
+                crypto_config.clone(),
             )
             .await
             .unwrap();
@@ -286,6 +357,7 @@ mod smoke_tests {
             public_config.clone(),
             private_config,
             client_parameters,
+            crypto_config.clone(),
         )
         .await
         .unwrap();
@@ -311,6 +383,7 @@ mod smoke_tests {
         let committee = Committee::new_for_benchmarks(committee_size);
         let public_config = NodePublicConfig::new_for_tests(committee_size).with_port_offset(200);
         let client_parameters = ClientParameters::default();
+        let crypto_config = CryptoConfig::default();
 
         let mut handles = Vec::new();
         let dir = TempDir::new("validator_crash_faults").unwrap();
@@ -331,6 +404,7 @@ mod smoke_tests {
                 public_config.clone(),
                 private_config,
                 client_parameters.clone(),
+                crypto_config.clone(),
             )
             .await
             .unwrap();

@@ -1,8 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crypto::types::ark_se_de_as_bytes;
 use std::{collections::HashMap, io, net::SocketAddr, ops::Range, sync::Arc, time::Duration};
-
+use ark_ed_on_bls12_381::EdwardsAffine;
 use futures::{
     future::{select, select_all, Either},
     FutureExt,
@@ -22,7 +23,7 @@ use tokio::{
     sync::mpsc,
     time::Instant,
 };
-
+use crypto::elgamal::Share;
 use crate::{
     config::NodePublicConfig,
     data::Data,
@@ -34,7 +35,7 @@ use crate::{
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum NetworkMessage {
     SubscribeOwnFrom(RoundNumber), // subscribe from round number excluding
     Block(Data<StatementBlock>),
@@ -42,8 +43,11 @@ pub enum NetworkMessage {
     RequestBlocks(Vec<BlockReference>),
     /// Indicate that a requested block is not found.
     BlockNotFound(Vec<BlockReference>),
+    #[serde(with = "ark_se_de_as_bytes")]
+    DkgCommitment(Vec<EdwardsAffine>),
+    DkgShare(Share),
+    PartialDecryptionShare(Vec<u8>), // 직렬화된 Vec<JubJubAffine> (ark-serialize)}
 }
-
 pub struct Network {
     connection_receiver: mpsc::Receiver<Connection>,
 }
