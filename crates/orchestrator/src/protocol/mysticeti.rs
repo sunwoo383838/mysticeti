@@ -155,6 +155,7 @@ impl ProtocolCommands for MysticetiProtocol {
                     .working_dir
                     .join(format!("private-config-{authority}.yaml"));
                 let client_parameters_path = self.working_dir.join("client-parameters.yaml");
+                let crypto_config_path = self.working_dir.join("crypto-config.yaml");
 
                 let run = [
                     &format!("./{BINARY_PATH}/mysticeti"),
@@ -166,6 +167,10 @@ impl ProtocolCommands for MysticetiProtocol {
                     &format!(
                         "--client-parameters-path {}",
                         client_parameters_path.display()
+                    ),
+                    &format!(
+                        "--crypto-config-path {}",
+                        crypto_config_path.display()
                     ),
                 ]
                 .join(" ");

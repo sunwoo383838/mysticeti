@@ -1,22 +1,24 @@
 ---
-testbed_id: "${USER}-mysticeti"
+testbed_id: "mysticeti-vote-test"
 cloud_provider: aws
 token_file: "/Users/${USER}/.aws/credentials"
-ssh_private_key_file: "/Users/${USER}/.ssh/aws"
+ssh_private_key_file: "~/.ssh/aws-prover-key"
 regions:
   # Virginia (버지니아) 설정
   - name: "us-east-1"
-    aga_dns_name: "va-aga.awsglobalaccelerator.com" # <--- 미리 생성된 버지니아 AGA의 DNS
-    nlb_arn: "arn:aws:elasticloadbalancing:us-east-1:1234567890:loadbalancer/net/..." # <--- 미리 생성된 버지니아 NLB의 ARN
+    aga_dns_name: "a943343be39d50660.awsglobalaccelerator.com" # <--- 미리 생성된 버지니아 AGA의 DNS
+    nlb_arn: "arn:aws:elasticloadbalancing:us-east-1:286430881698:loadbalancer/net/mysticeti-nlb-virginia/9a8265334e2892d2" # <--- 미리 생성된 버지니아 NLB의 ARN
   # Ohio (오하이오) 설정
   - name: "us-east-2"
-    aga_dns_name: "oh-aga.awsglobalaccelerator.com"
-    nlb_arn: "arn:aws:elasticloadbalancing:us-east-2:1234567890:loadbalancer/net/..."
+    aga_dns_name: "a0b7be1539244ca45.awsglobalaccelerator.com"
+    nlb_arn: "arn:aws:elasticloadbalancing:us-east-2:286430881698:loadbalancer/net/mysticeti-nlb-ohio/4688738e02fea20c"
   # Oregon (오레곤) 설정
   - name: "us-west-2"
-    aga_dns_name: "or-aga.awsglobalaccelerator.com"
-    nlb_arn: "arn:aws:elasticloadbalancing:us-west-2:1234567890:loadbalancer/net/..."
-specs: m5d.8xlarge
+    aga_dns_name: "a740353730ac140f5.awsglobalaccelerator.com"
+    nlb_arn: "arn:aws:elasticloadbalancing:us-west-2:286430881698:loadbalancer/net/mysticeti-nlb-oregon/7380f31b3b2aff67"
+specs: c8g.12xlarge
 repository:
   url: https://github.com/asonnino/mysticeti.git
-  commit: main
+  commit: mysticeti-vote
+
+benchmark_duration: 60

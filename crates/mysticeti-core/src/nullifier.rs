@@ -91,7 +91,6 @@ impl NullifierDB {
         &self,
         nullifier: Fr
     ) -> Result<()> {
-
         let cf = self
             .db
             .cf_handle(CF_NULLIFIER)
@@ -99,14 +98,46 @@ impl NullifierDB {
 
         let key = serialize_to_vec![nullifier]?;
         let txn = self.db.transaction();
+
         match txn.get_for_update_cf(cf, &key, true)? {
-            Some(_) => {
-                Err(eyre!("nullifier already exists (duplicate vote)"))
+            // --- 1. 키가 이미 DB에 존재하는 경우 (Locked 또는 Commit) ---
+            Some(existing_value) => {
+                let state: NullifierState = bincode::deserialize(&existing_value)
+                    .wrap_err("DB에서 NullifierState 역직렬화 실패")?;
+
+                match state {
+                    // [수정된 핵심 로직]
+                    // 상태가 'Locked'입니다. Mempool::verify()가 호출된 정상 경로입니다.
+                    // 'Commit' 상태로 업그레이드하고 성공(Ok)을 반환합니다.
+                    NullifierState::Locked => {
+                        let new_state = NullifierState::Commit;
+                        let new_value = bincode::serialize(&new_state)?;
+                        txn.put_cf(cf, &key, &new_value)?;
+                        txn.commit()?;
+                        Ok(())
+                    }
+
+                    // [기존 로직 유지]
+                    // 이미 'Commit' 상태입니다. 이는 중복 확정 시도(예: FPC와 C-Path 경쟁)입니다.
+                    // 오류를 반환하여 중복 확정임을 알립니다.
+                    NullifierState::Commit => {
+                        txn.rollback()?; // 트랜잭션 롤백
+                        Err(eyre!("nullifier already committed (duplicate finalize)"))
+                    }
+                }
             }
+
+            // --- 2. 키가 DB에 없는 경우 (None) ---
+            // C-Path Fallback 경로: Mempool(verify)을 거치지 않고 바로 확정되었습니다.
+            // 'Commit' 상태로 새로 기록합니다.
             None => {
                 let new_state = NullifierState::Commit;
-                txn.put_cf(&cf, &key, &bincode::serialize(&new_state)?)?;
+                let new_value = bincode::serialize(&new_state)?;
+                txn.put_cf(cf, &key, &new_value)?;
                 txn.commit()?;
+
+                // 'verify'를 거치지 않았으므로, 여기서 DB 크기 메트릭을 증가시킵니다.
+                self.metrics.nullifier_db_size.inc();
                 Ok(())
             }
         }

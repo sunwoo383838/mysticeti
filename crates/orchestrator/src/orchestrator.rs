@@ -236,7 +236,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         let local_crypto_config_path = local_batch_files_path.join(crypto_config_file_name);
         let remote_crypto_config_path = self.settings.working_dir.join(crypto_config_file_name);
 
-        let error_string = format!("Failed to read local crypto config file: {e}");
+        let error_string = format!("Failed to read local crypto config file");
         let static_message = Box::leak(error_string.into_boxed_str());
         let crypto_content = fs::read_to_string(&local_crypto_config_path)
             .map_err(|e|
@@ -669,7 +669,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         display::config("Commit", format!("'{}'", &self.settings.repository.commit));
         display::newline();
 
-        let local_batch_files_path = Path::new("/tmp/mysticeti_batch_files");
+        let local_batch_files_path = Path::new("/benchmark_batches/n10_t7_k7000000");
 
         // Cleanup the testbed (in case the previous run was not completed).
         self.cleanup(true).await?;
