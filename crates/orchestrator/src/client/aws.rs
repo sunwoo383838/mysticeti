@@ -4,6 +4,8 @@
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
+    sync::{Arc, Mutex}, // Mutex/Arc 추가
+    time::Duration,      // Duration 추가
 };
 
 use aws_config::{BehaviorVersion, Region};
@@ -13,26 +15,30 @@ use aws_sdk_ec2::{
     meta::PKG_VERSION,
     primitives::Blob,
     types::{
-        builders::{
-            BlockDeviceMappingBuilder,
-            EbsBlockDeviceBuilder,
-            FilterBuilder,
-            TagBuilder,
-            TagSpecificationBuilder,
-        },
-        EphemeralNvmeSupport,
+        // EC2 인스턴스 생성을 위한 빌더 (v1.x SDK의 `builders`는 비공개 API에 가까움)
+        // 대신 타입 자체의 `builder()` 메서드를 사용합니다.
+        BlockDeviceMapping,
+        EbsBlockDevice,
+        Filter,
+        IamInstanceProfileSpecification, // IAM 역할 지정을 위해 추가
         Instance as AwsInstance,
+        InstanceStateName, // 인스턴스 상태 확인을 위해 추가
         ResourceType,
+        Tag,
+        TagSpecification,
         VolumeType,
     },
 };
+use aws_sdk_ec2::types::{EphemeralNvmeSupport};
+// (신규) ELBv2(NLB) SDK 임포트
+use aws_sdk_elasticloadbalancingv2 as elbv2;
+use elbv2::types::{Action, ActionTypeEnum, ProtocolEnum, TargetDescription, TargetTypeEnum};
 use serde::Serialize;
+use tokio::time::sleep; // (신규) 대기 시간을 위해 추가
 
-use super::{Instance, ServerProviderClient};
-use crate::{
-    error::{CloudProviderError, CloudProviderResult},
-    settings::Settings,
-};
+use super::{Instance, InstanceStatus, ServerProviderClient};
+use crate::{display, error::{CloudProviderError, CloudProviderResult}, settings::Settings};
+
 
 // Make a request error from an AWS error message.
 impl<T> From<SdkError<T>> for CloudProviderError
@@ -44,12 +50,17 @@ where
     }
 }
 
+type PortAllocator = Arc<Mutex<HashMap<String, u16>>>;
+
 /// An AWS client.
 pub struct AwsClient {
     /// The settings of the testbed.
     settings: Settings,
     /// A list of clients, one per AWS region.
     clients: HashMap<String, aws_sdk_ec2::Client>,
+    elbv2_clients: HashMap<String, elbv2::Client>,
+    // (신규) 리전별 다음 할당 포트
+    next_port: PortAllocator,
 }
 
 impl Display for AwsClient {
@@ -71,17 +82,35 @@ impl AwsClient {
             .build();
 
         let mut clients = HashMap::new();
-        for region in settings.regions.clone() {
+        let mut elbv2_clients = HashMap::new();
+        let mut port_map = HashMap::new();
+
+        // (수정) settings.regions가 이제 Vec<RegionConfig>임
+        for region_config in settings.regions.clone() {
+            let region_name = region_config.name.clone();
             let sdk_config = aws_config::defaults(BehaviorVersion::v2024_03_28())
-                .region(Region::new(region.clone()))
+                .region(Region::new(region_name.clone()))
                 .profile_files(profile_files.clone())
                 .load()
                 .await;
+
             let client = aws_sdk_ec2::Client::new(&sdk_config);
-            clients.insert(region, client);
+            clients.insert(region_name.clone(), client);
+
+            // (신규) ELBv2 클라이언트 생성
+            let elbv2_client = elbv2::Client::new(&sdk_config);
+            elbv2_clients.insert(region_name.clone(), elbv2_client);
+
+            // (신규) 포트 할당기 초기화
+            port_map.insert(region_name, settings.ssh_start_port);
         }
 
-        Self { settings, clients }
+        Self {
+            settings,
+            clients,
+            elbv2_clients,
+            next_port: Arc::new(Mutex::new(port_map)),
+        }
     }
 
     /// Parse an AWS response and ignore errors if they mean a request is a duplicate.
@@ -101,18 +130,30 @@ impl AwsClient {
     }
 
     /// Convert an AWS instance into an orchestrator instance (used in the rest of the codebase).
-    fn make_instance(&self, region: String, aws_instance: &AwsInstance) -> Instance {
+    fn make_instance(
+        &self,
+        region: String,
+        aws_instance: &AwsInstance,
+        assigned_port: u16,
+        target_group_arn: String,
+        listener_arn: String,
+    ) -> Instance {
+        let region_config = self
+            .settings
+            .get_region_config(&region)
+            .expect("Region config not found in make_instance");
+
         Instance {
-            id: aws_instance
-                .instance_id()
-                .expect("AWS instance should have an id")
-                .into(),
+            id: aws_instance.instance_id().unwrap().into(),
             region,
+            // (수정) IP 대신 AGA DNS와 할당된 포트 사용
+            ssh_host: region_config.aga_dns_name.clone(),
+            ssh_port: assigned_port,
             main_ip: aws_instance
                 .public_ip_address()
-                .unwrap_or("0.0.0.0") // Stopped instances do not have an ip address.
+                .unwrap_or("0.0.0.0") // 중지된 인스턴스
                 .parse()
-                .expect("AWS instance should have a valid ip"),
+                .expect("AWS instance should have a valid public ip"),
             tags: vec![self.settings.testbed_id.clone()],
             specs: format!(
                 "{:?}",
@@ -128,26 +169,26 @@ impl AwsClient {
                     .name()
                     .expect("AWS status should have a name")
             )
-            .as_str()
-            .into(),
+                .as_str()
+                .into(),
+            // (신규) 생성된 리소스 ARN 저장 (삭제 시 필요)
+            nlb_target_group_arn: target_group_arn,
+            nlb_listener_arn: listener_arn,
         }
     }
 
-    /// Query the image id determining the os of the instances.
-    /// NOTE: The image id changes depending on the region.
     async fn find_image_id(&self, client: &aws_sdk_ec2::Client) -> CloudProviderResult<String> {
-        // Query all images that match the description.
         let request = client.describe_images().filters(
-            FilterBuilder::default()
+            Filter::builder() // v1.x SDK는 `Filter::builder()`를 사용
                 .name("description")
                 .values(Self::OS_IMAGE)
                 .build(),
         );
         let response = request.send().await?;
 
-        // Parse the response to select the first returned image id.
         response
-            .images()
+            .images
+            .unwrap_or_default()
             .first()
             .ok_or_else(|| CloudProviderError::RequestError("Cannot find image id".into()))?
             .image_id
@@ -161,7 +202,6 @@ impl AwsClient {
 
     /// Create a new security group for the instance (if it doesn't already exist).
     async fn create_security_group(&self, client: &aws_sdk_ec2::Client) -> CloudProviderResult<()> {
-        // Create a security group (if it doesn't already exist).
         let request = client
             .create_security_group()
             .group_name(&self.settings.testbed_id)
@@ -170,7 +210,6 @@ impl AwsClient {
         let response = request.send().await;
         Self::check_but_ignore_duplicates(response)?;
 
-        // Authorize all traffic on the security group.
         for protocol in ["tcp", "udp", "icmp", "icmpv6"] {
             let mut request = client
                 .authorize_security_group_ingress()
@@ -213,7 +252,7 @@ impl AwsClient {
             .settings
             .regions
             .first()
-            .and_then(|x| self.clients.get(x))
+            .and_then(|x| self.clients.get(&x.name))
         {
             Some(client) => client,
             None => return Ok(false),
@@ -237,23 +276,189 @@ impl AwsClient {
         }
         Ok(false)
     }
+
+    async fn wait_for_instance_running(
+        &self,
+        client: &aws_sdk_ec2::Client,
+        instance_id: &str,
+    ) -> CloudProviderResult<String> {
+        loop {
+            let response = client
+                .describe_instances()
+                .instance_ids(instance_id)
+                .send()
+                .await?;
+
+            let reservations = response.reservations.unwrap_or_default();
+
+            // 2. 이제 `reservations` 변수에서 데이터를 빌려옵니다.
+            //    `instance`는 `reservations`를 참조하며, `reservations`는
+            //    루프 반복이 끝날 때까지 살아있으므로 안전합니다.
+            let instance = reservations
+                .first() // &Vec<Reservation> -> Option<&Reservation>
+                .and_then(|r| r.instances.as_ref()) // Option<&Reservation> -> Option<&Vec<AwsInstance>>
+                .and_then(|i| i.first()) // Option<&Vec<AwsInstance>> -> Option<&AwsInstance>
+                .ok_or_else(|| {
+                    CloudProviderError::UnexpectedResponse(format!(
+                        "Instance {instance_id} not found after creation"
+                    ))
+                })?;
+
+            let state = instance
+                .state
+                .as_ref()
+                .and_then(|s| s.name.as_ref())
+                .ok_or_else(|| {
+                    CloudProviderError::UnexpectedResponse(format!(
+                        "Instance {instance_id} has no state"
+                    ))
+                })?;
+
+            match *state {
+                InstanceStateName::Running => {
+                    return Ok(instance
+                        .vpc_id
+                        .as_ref()
+                        .expect("Running instance must have VPC ID")
+                        .to_string());
+                }
+                InstanceStateName::Pending => {
+                    sleep(Duration::from_secs(5)).await;
+                }
+                _ => {
+                    return Err(CloudProviderError::UnexpectedResponse(format!(
+                        "Instance {instance_id} entered unexpected state: {:?}",
+                        state
+                    )));
+                }
+            }
+        }
+    }
 }
 
 impl ServerProviderClient for AwsClient {
     const USERNAME: &'static str = "ubuntu";
 
     async fn list_instances(&self) -> CloudProviderResult<Vec<Instance>> {
-        let filter = FilterBuilder::default()
+        let filter = Filter::builder()
             .name("tag:Name")
             .values(self.settings.testbed_id.clone())
             .build();
 
         let mut instances = Vec::new();
-        for (region, client) in &self.clients {
+
+        for region_config in &self.settings.regions {
+            let region = &region_config.name;
+            let client = self.clients.get(region).unwrap();
+            let elbv2_client = self.elbv2_clients.get(region).unwrap();
+            let nlb_arn = &region_config.nlb_arn;
+
+            // 1. 이 NLB의 모든 리스너를 가져옵니다.
+            let listeners = match elbv2_client
+                .describe_listeners()
+                .load_balancer_arn(nlb_arn)
+                .send()
+                .await
+            {
+                Ok(resp) => resp.listeners.unwrap_or_default(),
+                Err(e) => return Err(e.into()),
+            };
+
+            // 2. 리스너 포트, 리스너 ARN, 대상 그룹 ARN을 매핑합니다.
+            let mut tg_to_port_listener = HashMap::new();
+            for listener in listeners {
+                if let (Some(port), Some(actions), Some(listener_arn)) =
+                    (listener.port, listener.default_actions, listener.listener_arn)
+                {
+                    if let Some(tg_arn) = actions.first().and_then(|a| a.target_group_arn.as_ref())
+                    {
+                        // 사용자가 요청한 포트 범위(9000+)인지 확인
+                        if port >= self.settings.ssh_start_port as i32 {
+                            tg_to_port_listener.insert(
+                                tg_arn.to_string(),
+                                (port as u16, listener_arn.to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 3. 이 대상 그룹들의 타겟(EC2 인스턴스 ID)을 가져옵니다.
+            let mut instance_id_to_mapping = HashMap::new();
+            for (tg_arn, (port, listener_arn)) in tg_to_port_listener {
+                let health = match elbv2_client
+                    .describe_target_health()
+                    .target_group_arn(&tg_arn)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        display::warn(format!("Failed to describe target health for {}: {:?}", tg_arn, e));
+                        continue;
+                    }
+                };
+
+                if let Some(target) =
+                    health.target_health_descriptions.unwrap_or_default().first()
+                {
+                    if let Some(id) = target.target.as_ref().and_then(|t| t.id.as_ref()) {
+                        instance_id_to_mapping.insert(
+                            id.to_string(),
+                            (port, tg_arn.clone(), listener_arn.clone()),
+                        );
+                    }
+                }
+            }
+
+            // 4. 태그가 일치하는 EC2 인스턴스를 가져옵니다.
             let request = client.describe_instances().filters(filter.clone());
-            for reservation in request.send().await?.reservations() {
-                for instance in reservation.instances() {
-                    instances.push(self.make_instance(region.clone(), instance));
+            for reservation in request.send().await?.reservations.unwrap_or_default() {
+                for instance in reservation.instances.unwrap_or_default() {
+                    let instance_id = instance.instance_id().unwrap();
+
+                    // 5. EC2 인스턴스 정보와 NLB/AGA 매핑 정보를 결합합니다.
+                    if let Some((port, tg_arn, listener_arn)) =
+                        instance_id_to_mapping.get(instance_id)
+                    {
+                        instances.push(self.make_instance(
+                            region.clone(),
+                            &instance,
+                            *port,
+                            tg_arn.clone(),
+                            listener_arn.clone(),
+                        ));
+                    } else {
+                        // NLB 매핑이 없는 (아직 생성 중이거나, 오류가 발생한) 인스턴스
+                        // 또는 모니터링 인스턴스 등 다른 용도의 인스턴스일 수 있습니다.
+                        // 여기서는 SSH 접속이 불가능한 '불완전한' 상태로 추가합니다.
+                        let status_str = format!(
+                            "{:?}",
+                            instance.state().unwrap().name().unwrap()
+                        )
+                            .as_str()
+                            .into();
+
+                        // 'terminated' 상태가 아닌 경우에만 추가 (이미 종료된 인스턴스 제외)
+                        if status_str != InstanceStatus::Terminated {
+                            instances.push(Instance {
+                                id: instance_id.to_string(),
+                                region: region.clone(),
+                                main_ip: instance
+                                    .public_ip_address()
+                                    .unwrap_or("0.0.0.0") // 중지된 인스턴스
+                                    .parse()
+                                    .expect("AWS instance should have a valid public ip"),
+                                ssh_host: "unknown.aga.com".to_string(), // 접속 불가
+                                ssh_port: 0,
+                                tags: vec![self.settings.testbed_id.clone()],
+                                specs: format!("{:?}", instance.instance_type().unwrap()),
+                                status: status_str,
+                                nlb_target_group_arn: "unknown".to_string(),
+                                nlb_listener_arn: "unknown".to_string(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -317,23 +522,41 @@ impl ServerProviderClient for AwsClient {
         let client = self.clients.get(&region).ok_or_else(|| {
             CloudProviderError::RequestError(format!("Undefined region {region:?}"))
         })?;
+        let elbv2_client = self.elbv2_clients.get(&region).ok_or_else(|| {
+            CloudProviderError::RequestError(format!("Undefined ELBv2 client for region {region:?}"))
+        })?;
+        let region_config = self.settings.get_region_config(&region).ok_or_else(|| {
+            CloudProviderError::RequestError(format!("Undefined RegionConfig for region {region:?}"))
+        })?;
 
-        // Create a security group (if needed).
+        // 1. (신규) 이 인스턴스에 대한 고유 포트 할당
+        let assigned_port = {
+            let mut ports = self.next_port.lock().unwrap();
+            let port = ports
+                .entry(region.clone())
+                .or_insert(self.settings.ssh_start_port);
+            let assigned_port = *port;
+            *port += 1; // 다음 포트를 위해 1 증가
+            assigned_port
+        };
+
+        // 2. 보안 그룹 생성 (기존 로직)
         self.create_security_group(client).await?;
 
-        // Query the image id.
+        // 3. 이미지 ID 찾기 (기존 로직)
         let image_id = self.find_image_id(client).await?;
 
-        // Create a new instance.
-        let tags = TagSpecificationBuilder::default()
+        // 4. 태그 정의 (v1.x SDK 문법 수정)
+        let tags = TagSpecification::builder()
             .resource_type(ResourceType::Instance)
-            .tags(TagBuilder::default().key("Name").value(testbed_id).build())
+            .tags(Tag::builder().key("Name").value(testbed_id).build())
             .build();
 
-        let storage = BlockDeviceMappingBuilder::default()
+        // 5. 스토리지 정의 (v1.x SDK 문법 수정)
+        let storage = BlockDeviceMapping::builder()
             .device_name("/dev/sda1")
             .ebs(
-                EbsBlockDeviceBuilder::default()
+                EbsBlockDevice::builder()
                     .delete_on_termination(true)
                     .volume_size(Self::DEFAULT_EBS_SIZE_GB)
                     .volume_type(VolumeType::Gp2)
@@ -341,6 +564,7 @@ impl ServerProviderClient for AwsClient {
             )
             .build();
 
+        // 6. EC2 인스턴스 생성 요청
         let request = client
             .run_instances()
             .image_id(image_id)
@@ -353,19 +577,149 @@ impl ServerProviderClient for AwsClient {
             .tag_specifications(tags);
 
         let response = request.send().await?;
-        let instance = &response
-            .instances()
+        let aws_instance_slim = &response
+            .instances
+            .as_ref()
+            .expect("AWS instances list should contain instances")
             .first()
-            .expect("AWS instances list should contain instances");
+            .unwrap();
+        let instance_id = aws_instance_slim.instance_id().unwrap();
 
-        Ok(self.make_instance(region, instance))
+        // 7. (신규) EC2가 'running' 상태가 될 때까지 대기
+        let vpc_id = self
+            .wait_for_instance_running(client, instance_id)
+            .await?;
+
+        // 8. (신규) NLB 대상 그룹(Target Group) 생성
+        let tg_name = format!("mysticeti-tg-{}-{}", region, assigned_port);
+        let tg_response = elbv2_client
+            .create_target_group()
+            .name(tg_name)
+            .protocol(ProtocolEnum::Tcp)
+            .port(22) // 대상은 EC2의 SSH 포트(22)
+            .vpc_id(vpc_id)
+            .target_type(TargetTypeEnum::Instance)
+            .send()
+            .await?;
+
+        let target_group_arn = tg_response
+            .target_groups
+            .as_ref()
+            .unwrap()
+            .first()
+            .unwrap()
+            .target_group_arn
+            .as_ref()
+            .unwrap();
+
+        // 9. (신규) 대상 그룹에 EC2 인스턴스 등록
+        elbv2_client
+            .register_targets()
+            .target_group_arn(target_group_arn)
+            .targets(
+                TargetDescription::builder()
+                    .id(instance_id)
+                    .build(),
+            )
+            .send()
+            .await?;
+
+        // 10. (신규) NLB에 리스너 생성 (AGA 포트 -> 대상 그룹)
+        let listener_response = elbv2_client
+            .create_listener()
+            .load_balancer_arn(&region_config.nlb_arn)
+            .protocol(ProtocolEnum::Tcp)
+            .port(assigned_port as i32) // 예: 9000
+            .default_actions(
+                Action::builder()
+                    .r#type(ActionTypeEnum::Forward)
+                    .target_group_arn(target_group_arn)
+                    .build()
+            )
+            .send()
+            .await?;
+
+        let listener_arn = listener_response
+            .listeners
+            .as_ref()
+            .unwrap()
+            .first()
+            .unwrap()
+            .listener_arn
+            .as_ref()
+            .unwrap();
+
+        // 11. (수정) make_instance 호출
+        // describe_instances를 다시 호출하여 전체 AwsInstance 정보를 가져옵니다.
+        let full_aws_instance = client
+            .describe_instances()
+            .instance_ids(instance_id)
+            .send()
+            .await?
+            .reservations
+            .unwrap()
+            .first()
+            .unwrap()
+            .instances
+            .as_ref()
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+
+        Ok(self.make_instance(
+            region,
+            &full_aws_instance,
+            assigned_port,
+            target_group_arn.to_string(),
+            listener_arn.to_string(),
+        ))
     }
 
+    /// (수정) EC2 종료 시 NLB 리스너 및 대상 그룹 동적 삭제
     async fn delete_instance(&self, instance: Instance) -> CloudProviderResult<()> {
         let client = self.clients.get(&instance.region).ok_or_else(|| {
             CloudProviderError::RequestError(format!("Undefined region {:?}", instance.region))
         })?;
+        let elbv2_client = self.elbv2_clients.get(&instance.region).ok_or_else(|| {
+            CloudProviderError::RequestError(format!(
+                "Undefined ELBv2 client for region {:?}",
+                instance.region
+            ))
+        })?;
 
+        // (신규) 1. NLB 리스너 삭제
+        // 오류가 발생해도 무시하고 다음 단계 진행 (정리 작업이므로)
+        if let Err(e) = elbv2_client
+            .delete_listener()
+            .listener_arn(&instance.nlb_listener_arn)
+            .send()
+            .await
+        {
+            display::warn(format!("Failed to delete listener {}: {:?}",
+                                  instance.nlb_listener_arn,
+                                  e)
+            );
+        } else {
+            // 리스너 삭제가 성공하면 대상 그룹 삭제 전에 잠시 대기
+            sleep(Duration::from_secs(5)).await;
+        }
+
+        // (신규) 2. NLB 대상 그룹 삭제
+        if let Err(e) = elbv2_client
+            .delete_target_group()
+            .target_group_arn(&instance.nlb_target_group_arn)
+            .send()
+            .await
+        {
+            display::warn(
+                format!("Failed to delete target group {}: {:?}",
+                        instance.nlb_target_group_arn,
+                        e)
+            );
+        }
+
+        // (기존) 3. EC2 인스턴스 종료
         client
             .terminate_instances()
             .set_instance_ids(Some(vec![instance.id.clone()]))

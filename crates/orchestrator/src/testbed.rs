@@ -68,16 +68,18 @@ impl<C: ServerProviderClient> Testbed<C> {
             .instances
             .iter()
             .filter(|instance| self.settings.filter_instances(instance));
+
+        // (수정) `region`은 이제 `&RegionConfig`입니다. `region.name` (String)을 비교합니다.
         let sorted: Vec<(_, Vec<_>)> = self
             .settings
-            .regions
+            .regions // Vec<RegionConfig>
             .iter()
-            .map(|region| {
+            .map(|region_config| { // region_config는 &RegionConfig
                 (
-                    region,
+                    &region_config.name, // 튜플의 첫 번째 요소로 &String (이름)을 사용
                     filtered
                         .clone()
-                        .filter(|instance| &instance.region == region)
+                        .filter(|instance| instance.region == region_config.name) // String == String 비교
                         .collect(),
                 )
             })
@@ -87,9 +89,13 @@ impl<C: ServerProviderClient> Testbed<C> {
         table.set_format(display::default_table_format());
 
         let active = filtered.filter(|x| x.is_active()).count();
-        table.set_titles(row![bH2->format!("Instances ({active})")]);
-        for (i, (region, instances)) in sorted.iter().enumerate() {
-            table.add_row(row![bH2->region.to_uppercase()]);
+
+        // (수정) 테이블 타이틀 변경 (SSH 접속 정보와 IP 분리)
+        table.set_titles(row![bH2->format!("Instances ({active})"), "SSH Command (Control Plane)", "Instance IP (Data Plane / Metrics)"]);
+
+        for (i, (region_name, instances)) in sorted.iter().enumerate() {
+            // (수정) 3열로 확장
+            table.add_row(row![bH2->region_name.to_uppercase(), "", ""]);
             let mut j = 0;
             for instance in instances {
                 if j % 5 == 0 {
@@ -97,13 +103,21 @@ impl<C: ServerProviderClient> Testbed<C> {
                 }
                 let private_key_file = self.settings.ssh_private_key_file.display();
                 let username = C::USERNAME;
-                let ip = instance.main_ip;
-                let connect = format!("ssh -i {private_key_file} {username}@{ip}");
+
+                // (수정) SSH 접속은 ssh_host와 ssh_port 사용
+                let connect = format!(
+                    "ssh -i {private_key_file} {username}@{} -p {}",
+                    instance.ssh_host, instance.ssh_port
+                );
+                // (수정) 실제 IP(main_ip)는 별도 열에 표시
+                let metrics_ip = instance.main_ip;
+
                 if !instance.is_terminated() {
                     if instance.is_active() {
-                        table.add_row(row![bFg->format!("{j}"), connect]);
+                        // (수정) 3열로 확장
+                        table.add_row(row![bFg->format!("{j}"), connect, metrics_ip]);
                     } else {
-                        table.add_row(row![bFr->format!("{j}"), connect]);
+                        table.add_row(row![bFr->format!("{j}"), connect, metrics_ip]);
                     }
                     j += 1;
                 }
@@ -132,10 +146,11 @@ impl<C: ServerProviderClient> Testbed<C> {
                 try_join_all((0..quantity).map(|_| self.client.create_instance(x.clone()))).await?
             }
             None => {
-                try_join_all(self.settings.regions.iter().flat_map(|region| {
-                    (0..quantity).map(|_| self.client.create_instance(region.clone()))
+                // (수정) `settings.regions`를 순회하며 `region.name`을 사용
+                try_join_all(self.settings.regions.iter().flat_map(|region_config| {
+                    (0..quantity).map(|_| self.client.create_instance(region_config.name.clone()))
                 }))
-                .await?
+                    .await?
             }
         };
 
@@ -171,12 +186,12 @@ impl<C: ServerProviderClient> Testbed<C> {
 
         // Gather available instances.
         let mut available = Vec::new();
-        for region in &self.settings.regions {
+        for region_config in &self.settings.regions {
             available.extend(
                 self.instances
                     .iter()
                     .filter(|x| {
-                        x.is_inactive() && &x.region == region && self.settings.filter_instances(x)
+                        x.is_inactive() && &x.region == &region_config.name && self.settings.filter_instances(x)
                     })
                     .take(quantity)
                     .cloned()
@@ -224,7 +239,7 @@ impl<C: ServerProviderClient> Testbed<C> {
     where
         I: Iterator<Item = &'a Instance> + Clone,
     {
-        let instances_ids: Vec<_> = instances.map(|x| x.id.clone()).collect();
+        let instances_ids: Vec<_> = instances.clone().map(|x| x.id.clone()).collect();
 
         let mut interval = time::interval(Duration::from_secs(5));
         interval.tick().await; // The first tick returns immediately.
@@ -235,21 +250,33 @@ impl<C: ServerProviderClient> Testbed<C> {
             let elapsed = now.duration_since(start).as_secs_f64().ceil() as u64;
             display::status(format!("{elapsed}s"));
 
+            // (수정) list_instances는 EC2와 NLB/AGA를 모두 확인하여 완전한 Instance 객체를 반환
             let instances = self.client.list_instances().await?;
             let futures = instances
                 .iter()
                 .filter(|x| instances_ids.contains(&x.id))
                 .map(|instance| {
                     let private_key_file = self.settings.ssh_private_key_file.clone();
+                    // (수정) SshConnection::new는 instance.ssh_address()를 통해
+                    // (AGA_DNS, Port)로 접속을 시도
                     SshConnection::new(instance.ssh_address(), C::USERNAME, private_key_file)
                 });
-            if try_join_all(futures).await.is_ok() {
+
+            // (수정) 모든 인스턴스가 SSH 접속 가능하고 'Active' 상태인지 확인
+            let all_reachable = try_join_all(futures).await.is_ok();
+            let all_active = instances
+                .iter()
+                .filter(|x| instances_ids.contains(&x.id))
+                .all(|x| x.is_active());
+
+            if all_reachable && all_active {
                 break;
             }
         }
         Ok(())
     }
 }
+
 
 #[cfg(test)]
 mod test {
@@ -294,18 +321,18 @@ mod test {
         let result = testbed.start(2).await;
 
         assert!(result.is_ok());
-        for region in &testbed.settings.regions {
+        for region_config in &testbed.settings.regions {
             let active = testbed
                 .instances
                 .iter()
-                .filter(|x| x.is_active() && &x.region == region)
+                .filter(|x| x.is_active() && &x.region == &region_config.name)
                 .count();
             assert_eq!(active, 2);
 
             let inactive = testbed
                 .instances
                 .iter()
-                .filter(|x| x.is_inactive() && &x.region == region)
+                .filter(|x| x.is_inactive() && &x.region == &region_config.name)
                 .count();
             assert_eq!(inactive, 3);
         }

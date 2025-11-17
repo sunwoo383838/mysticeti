@@ -99,7 +99,7 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
             block_store,
             committee,
             stop: stop_sender.clone(),
-            epoch_close_signal: epoch_sender.clone(),
+            epoch_close_signal: epoch_sender,
             epoch_closing_time,
             dkg_manager
         });
@@ -117,7 +117,7 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
             block_fetcher,
             metrics.clone(),
         ));
-        let syncer_task = AsyncWalSyncer::start(wal_syncer, stop_sender, epoch_sender);
+        let syncer_task = AsyncWalSyncer::start(wal_syncer, stop_sender);
         Self {
             inner,
             main_task,
@@ -339,17 +339,21 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
                 // ❗ (핵심 트리거)
                 // shutdown_duration이 0이 되어도 이 브랜치가 즉시 실행됩니다.
                 _epoch_shutdown = runtime::sleep(shutdown_duration), if !tallying_started => {
+                    tallying_started = true;
+                    // ❗ Inner의 Sender는 Arc로 감싸져 있지 않으므로,
+                    // ❗ Tally 태스크가 Sender를 소유하도록 전달할 수 없음.
+                    // ❗ Tally 태스크가 inner를 받아 Sender를 drop하게 해야 함.
 
-                    tracing::info!("Epoch closing grace period ended. Starting End-of-Epoch Tally Protocol.");
-                    tallying_started = true; // ❗ 집계 시작 플래그
+                    // [최종 수정] Tally가 완료되면 `leader_timeout_task`가
+                    // `Receiver`를 `drop`하여 스스로 종료하고,
+                    // `recv_or_stopped`는 `leader_timeout_task`가 종료되면
+                    // `epoch_close_signal.send()`가 실패하여 종료되도록 해야 함.
 
-                    // ❗ Tally 태스크를 실행하고, *Sender*의 복제본을 이동시킵니다.
-                    // ❗ Receiver(`epoch_close_signal`)는 이동하지 않습니다.
+                    // ❗ Tally 태스크 실행 (Sender 복제본 전달)
                     Handle::current().spawn(Self::run_tally_protocol(
                         inner.clone(),
-                        inner.epoch_close_signal.clone(), // ❗ Sender 복제본을 이동
+                        inner.epoch_close_signal.clone(), // ❗ Sender 복제본 전달
                     ));
-
                     // Receiver는 계속 이 태스크가 소유합니다.
                 }
 
@@ -370,7 +374,7 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
     // --- ❗ (신규) Tally 프로토콜 헬퍼 함수 ---
     async fn run_tally_protocol( // ❗ H 제네릭 추가
         inner: Arc<NetworkSyncerInner<H>>,
-        epoch_close_signal_sender: mpsc::Sender<()>, // ❗ Sender를 받음
+        epoch_close_signal_sender: mpsc::Sender<()>, // ❗ Sender 복제본
     ) {
         // 1. Core에 모든 커밋된 트랜잭션 요청
         let all_committed_tx_locators = inner.syncer
@@ -411,7 +415,7 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
 
         // 10. ❗ 모든 작업 완료 후, *Sender*를 drop하여 채널을 닫음
         tracing::info!("Tallying complete. Shutting down network sync.");
-        drop(epoch_close_signal_sender); // ❗ Sender를 drop
+        drop(epoch_close_signal_sender); // ❗ Inner의 Sender를 drop
     }
 
     async fn perform_he_aggregation(txs: Vec<Transaction>) -> Vec<u8> {
@@ -614,10 +618,6 @@ impl<H: BlockHandler + 'static> NetworkSyncerInner<H> {
                 assert!(stopped.is_err());
                 None
             }
-            closed = self.epoch_close_signal.send(()) => {
-                assert!(closed.is_err());
-                None
-            }
             data = channel.recv() => {
                 data
             }
@@ -628,9 +628,6 @@ impl<H: BlockHandler + 'static> NetworkSyncerInner<H> {
         select! {
             stopped = self.stop.send(()) => {
                 assert!(stopped.is_err());
-            }
-            closed = self.epoch_close_signal.send(()) => {
-                assert!(closed.is_err());
             }
         }
     }
@@ -645,7 +642,6 @@ impl SyncerSignals for Arc<Notify> {
 pub struct AsyncWalSyncer {
     wal_syncer: WalSyncer,
     stop: mpsc::Sender<()>,
-    epoch_signal: mpsc::Sender<()>,
     _sender: oneshot::Sender<()>,
     runtime: tokio::runtime::Handle,
 }
@@ -655,13 +651,11 @@ impl AsyncWalSyncer {
     pub fn start(
         wal_syncer: WalSyncer,
         stop: mpsc::Sender<()>,
-        epoch_signal: mpsc::Sender<()>,
     ) -> oneshot::Receiver<()> {
         let (sender, receiver) = oneshot::channel();
         let this = Self {
             wal_syncer,
             stop,
-            epoch_signal,
             _sender: sender,
             runtime: tokio::runtime::Handle::current(),
         };
@@ -698,10 +692,6 @@ impl AsyncWalSyncer {
                 false
             }
             _signal = self.stop.send(()) => {
-                true
-            }
-            _ = self.epoch_signal.send(()) => {
-                // might need to sync wal completely before shutting down
                 true
             }
         }

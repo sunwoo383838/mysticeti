@@ -6,7 +6,11 @@ use std::{
     fs,
     path::PathBuf,
 };
+use std::path::Path;
 use std::time::Duration;
+use futures::future::join_all;
+use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
 
 use crate::{
@@ -43,6 +47,10 @@ pub struct Orchestrator<P> {
     /// Skip the testbed configuration. Setting this value to true is dangerous and may
     /// lead to unexpected behavior.
     skip_testbed_configuration: bool,
+}
+
+fn get_local_batch_file_path(local_base_path: &Path, authority_index: usize) -> PathBuf {
+    local_base_path.join(format!("validator_{}_txs.bin", authority_index))
 }
 
 impl<P> Orchestrator<P> {
@@ -105,7 +113,7 @@ impl<P> Orchestrator<P> {
 
         // Sort the instances by region. This step ensures that the instances are selected as
         // equally as possible from all regions.
-        let mut instances_by_regions = HashMap::new();
+        let mut instances_by_regions: HashMap<&String, VecDeque<&Instance>> = HashMap::new();
         for instance in available_instances {
             instances_by_regions
                 .entry(&instance.region)
@@ -116,32 +124,36 @@ impl<P> Orchestrator<P> {
         // Select the instance to host the monitoring stack.
         let mut monitoring_instance = None;
         if self.settings.monitoring {
-            let region = &self.settings.regions[0];
+            let region_name = &self.settings.regions[0].name;
             monitoring_instance = instances_by_regions
-                .get_mut(region)
+                .get_mut(region_name)
                 .map(|instances| instances.pop_front().unwrap().clone());
         }
 
         // Select the instances to host exclusively load generators.
         let mut client_instances = Vec::new();
-        for region in self.settings.regions.iter().cycle() {
+        for region_config in self.settings.regions.iter().cycle() {
             if client_instances.len() == self.settings.dedicated_clients {
                 break;
             }
-            if let Some(regional_instances) = instances_by_regions.get_mut(region) {
+            let region_name = &region_config.name;
+            if let Some(regional_instances) = instances_by_regions.get_mut(region_name) {
                 if let Some(instance) = regional_instances.pop_front() {
                     client_instances.push(instance.clone());
                 }
             }
         }
 
+
+
         // Select the instances to host the nodes.
         let mut nodes_instances = Vec::new();
-        for region in self.settings.regions.iter().cycle() {
+        for region_config in self.settings.regions.iter().cycle() {
             if nodes_instances.len() == parameters.nodes {
                 break;
             }
-            if let Some(regional_instances) = instances_by_regions.get_mut(region) {
+            let region_name = &region_config.name;
+            if let Some(regional_instances) = instances_by_regions.get_mut(region_name) {
                 if let Some(instance) = regional_instances.pop_front() {
                     nodes_instances.push(instance.clone());
                 }
@@ -209,6 +221,92 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         let active = self.instances.iter().filter(|x| x.is_active()).cloned();
         let context = CommandContext::default();
         self.ssh_manager.execute(active, command, context).await?;
+
+        display::done();
+        Ok(())
+    }
+
+    /// 인스턴스의 인덱스를 기반으로 각 밸리데이터에게 고유의 배치 파일을 배포합니다.
+    async fn distribute_batch_files(&self, local_batch_files_path: &Path, parameters: &BenchmarkParameters) -> TestbedResult<()> {
+        display::action("Distributing unique batch transaction files (1GB/node via AGA)");
+
+        let (_, nodes, _) = self.select_instances(parameters)?;
+
+        let crypto_config_file_name = "crypto-config.yaml";
+        let local_crypto_config_path = local_batch_files_path.join(crypto_config_file_name);
+        let remote_crypto_config_path = self.settings.working_dir.join(crypto_config_file_name);
+
+        let error_string = format!("Failed to read local crypto config file: {e}");
+        let static_message = Box::leak(error_string.into_boxed_str());
+        let crypto_content = fs::read_to_string(&local_crypto_config_path)
+            .map_err(|e|
+
+                TestbedError::SshError(
+                crate::error::SshError::SessionError {
+                    address: "Local file system".parse().unwrap(),
+                    error: ssh2::Error::new(ssh2::ErrorCode::Session(-1), static_message)
+                }
+            ))?;
+
+        // SSH 환경에 맞게 내용을 이스케이프하고 원격 echo 명령을 구성합니다.
+        // NOTE: Rust 문자열 리터럴에서 \n을 \n으로, '를 \'로 이스케이프해야 합니다.
+        let escaped_content = crypto_content.replace('\'', "'\\''");
+        let remote_echo_command = format!(
+            "echo -e '{}' > {}",
+            // '\n' 문자를 '\\n'으로 이스케이프해야 원격 셸이 이를 새 줄 문자로 해석합니다.
+            escaped_content.replace('\n', "\\n"),
+            remote_crypto_config_path.display()
+        );
+
+        display::status("Uploading crypto config via echo...");
+        self.ssh_manager.execute(nodes.clone(), remote_echo_command, CommandContext::default()).await?;
+
+        // 1. 현재 활성화된 노드 목록을 가져옵니다.
+        let (_, nodes, _) = self.select_instances(parameters)?;
+
+        // 2. 각 노드별로 파일을 업로드하는 태스크를 병렬로 생성합니다.
+        let handles: Vec<JoinHandle<Result<(), TestbedError>>> = nodes.into_iter().enumerate().map(|(i, instance)| {
+            let authority_index = i;
+
+            let local_path = get_local_batch_file_path(local_batch_files_path, authority_index);
+            let remote_path = self.settings.working_dir.join(local_path.file_name().unwrap());
+
+            // 파일이 존재하는지 로컬에서 미리 확인
+            if !local_path.exists() {
+                let local_path_display = local_path.display().to_string();
+                return Handle::current().spawn(async move {
+                    Err(TestbedError::SshError(
+                        crate::error::SshError::NonZeroExitCode {
+                            address: instance.ssh_address(),
+                            code: 1,
+                            message: format!("Local batch file not found: {local_path_display}"),
+                        }
+                    ))
+                }).into();
+            }
+
+            // 업로드 작업을 SshConnectionManager를 통해 실행합니다. (AGA 가속 채널 사용)
+            let manager = self.ssh_manager.clone();
+
+            // tokio::spawn을 사용하여 블로킹 SCP 호출을 풀링 스레드에서 실행
+            tokio::spawn(async move {
+                display::status(format!("Uploading to {} (Port: {})", instance.id, instance.ssh_port));
+
+                // SshConnectionManager::upload 호출
+                manager.upload(
+                    std::iter::once(instance),
+                    local_path,
+                    remote_path
+                ).await?;
+
+                Ok(())
+            }).into()
+        }).collect();
+
+        // 3. 모든 병렬 업로드 작업이 완료될 때까지 대기합니다.
+        for handle in join_all(handles).await {
+            handle??;
+        }
 
         display::done();
         Ok(())
@@ -571,6 +669,8 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         display::config("Commit", format!("'{}'", &self.settings.repository.commit));
         display::newline();
 
+        let local_batch_files_path = Path::new("/tmp/mysticeti_batch_files");
+
         // Cleanup the testbed (in case the previous run was not completed).
         self.cleanup(true).await?;
 
@@ -593,6 +693,12 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             self.cleanup(true).await?;
             // Start the instance monitoring tools.
             self.start_monitoring(&parameters).await?;
+
+            if local_batch_files_path.exists() {
+                self.distribute_batch_files(local_batch_files_path, &parameters).await?;
+            } else {
+                display::warn(format!("Local staging directory for batch files not found: {}. Skipping file distribution.", local_batch_files_path.display()));
+            }
 
             // Configure all instances (if needed).
             if !self.skip_testbed_configuration && latest_committee_size != parameters.nodes {

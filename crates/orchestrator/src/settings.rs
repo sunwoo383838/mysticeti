@@ -19,6 +19,19 @@ use crate::{
     faults::FaultsType,
 };
 
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RegionConfig {
+    /// AWS 리전 이름 (예: us-east-1)
+    pub name: String,
+
+    /// 이 리전을 위한 AGA의 글로벌 DNS 이름
+    pub aga_dns_name: String,
+
+    /// 이 리전에 미리 생성해 둔 NLB의 ARN
+    pub nlb_arn: String,
+}
+
 /// The git repository holding the codebase.
 #[serde_as]
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -83,7 +96,7 @@ pub struct Settings {
     /// public key defaults the same path as the private key with an added extension 'pub'.
     pub ssh_public_key_file: Option<PathBuf>,
     /// The list of cloud provider regions to deploy the testbed.
-    pub regions: Vec<String>,
+    pub regions: Vec<RegionConfig>,
     /// The specs of the instances to deploy. Those are dependent on the cloud provider, e.g.,
     /// specifying 't3.medium' creates instances with 2 vCPU and 4GBo of ram on AWS.
     pub specs: String,
@@ -136,6 +149,8 @@ pub struct Settings {
     /// The number of times the orchestrator should retry an ssh command.
     #[serde(default = "defaults::default_ssh_retries")]
     pub ssh_retries: usize,
+    #[serde(default = "defaults::default_ssh_start_port")]
+    pub ssh_start_port: u16,
 }
 
 mod defaults {
@@ -190,6 +205,10 @@ mod defaults {
     pub fn default_ssh_retries() -> usize {
         3
     }
+
+    pub fn default_ssh_start_port() -> u16 {
+        9000
+    }
 }
 
 impl Settings {
@@ -214,6 +233,13 @@ impl Settings {
             message: e.to_string(),
         })
     }
+
+    // (신규) 리전 이름으로 RegionConfig를 쉽게 찾기 위한 헬퍼
+    pub fn get_region_config(&self, region_name: &str) -> Option<&RegionConfig> {
+        self.regions.iter().find(|r| r.name == region_name)
+    }
+
+
 
     // Resolves ${ENV} into it's value for each env variable.
     fn resolve_env<P>(path: P, s: &str) -> SettingsResult<String>
@@ -273,11 +299,11 @@ impl Settings {
         }
     }
 
-    /// Check whether the input instance matches the criteria described in the settings.
+    // (수정) filter_instances가 RegionConfig를 사용하도록
     pub fn filter_instances(&self, instance: &Instance) -> bool {
-        self.regions.contains(&instance.region)
+        self.regions.iter().any(|r| r.name == instance.region)
             && instance.specs.to_lowercase().replace('.', "")
-                == self.specs.to_lowercase().replace('.', "")
+            == self.specs.to_lowercase().replace('.', "")
     }
 
     /// The number of regions specified in the settings.

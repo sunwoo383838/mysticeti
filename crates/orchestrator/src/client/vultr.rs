@@ -50,10 +50,16 @@ impl From<VultrInstance> for Instance {
         Self {
             id: instance.id,
             region: instance.region,
+            // (신규) Vultr은 AGA를 사용하지 않으므로, ssh_host는 main_ip와 동일
+            ssh_host: instance.main_ip.to_string(),
+            // (신규) Vultr은 표준 SSH 포트 22 사용
+            ssh_port: 22,
             main_ip: instance.main_ip,
             tags: instance.tags,
             specs: instance.plan,
             status: instance.power_status.as_str().into(),
+            nlb_target_group_arn: String::default(),
+            nlb_listener_arn: String::default(),
         }
     }
 }
@@ -61,7 +67,8 @@ impl From<VultrInstance> for Instance {
 impl VultrInstance {
     /// Return whether the instance matches the parameters specified in the setting file.
     pub fn filter(&self, settings: &Settings) -> bool {
-        settings.regions.contains(&self.region)
+        // (수정) Vec<RegionConfig>의 `name` 필드와 `self.region`(String)을 비교합니다.
+        settings.regions.iter().any(|r| r.name == self.region)
             && self.tags.contains(&settings.testbed_id)
             && self.plan == settings.specs
     }
@@ -227,7 +234,9 @@ impl ServerProviderClient for VultrClient {
         let json: Value = response.json().await?;
         Self::check_response(&json)?;
         let content = json["instance"].clone();
-        serde_json::from_value::<Instance>(content).map_err(CloudProviderError::from)
+        let vultr_instance: VultrInstance = serde_json::from_value(content)
+            .map_err(CloudProviderError::from)?;
+        Ok(vultr_instance.into())
     }
 
     async fn delete_instance(&self, instance: Instance) -> CloudProviderResult<()> {

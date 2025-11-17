@@ -5,7 +5,7 @@ use std::{
     fmt::Display,
     net::{Ipv4Addr, SocketAddr},
 };
-
+use std::net::ToSocketAddrs;
 use serde::{Deserialize, Serialize};
 
 use crate::error::CloudProviderResult;
@@ -37,14 +37,21 @@ pub struct Instance {
     pub id: String,
     /// The region where the instance runs.
     pub region: String,
-    /// The public ip address of the instance (accessible from anywhere).
+
+    pub ssh_host: String, // 예: "va-aga.awsglobalaccelerator.com"
+    pub ssh_port: u16,    // 예: 9000
+
     pub main_ip: Ipv4Addr,
+
     /// The list of tags associated with the instance.
     pub tags: Vec<String>,
     /// The specs of the instance.
     pub specs: String,
     /// The current status of the instance.
     pub status: InstanceStatus,
+
+    pub nlb_target_group_arn: String,
+    pub nlb_listener_arn: String,
 }
 
 impl Instance {
@@ -65,7 +72,11 @@ impl Instance {
 
     /// Return the ssh address to connect to the instance.
     pub fn ssh_address(&self) -> SocketAddr {
-        SocketAddr::new(self.main_ip.into(), 22)
+        (self.ssh_host.as_str(), self.ssh_port)
+            .to_socket_addrs()
+            .expect("Failed to resolve AGA DNS")
+            .next()
+            .expect("No addresses found for AGA DNS")
     }
 
     #[cfg(test)]
@@ -73,10 +84,14 @@ impl Instance {
         Self {
             id,
             region: Default::default(),
+            ssh_host: "127.0.0.1".to_string(),
             main_ip: Ipv4Addr::LOCALHOST,
+            ssh_port: 22,
             tags: Default::default(),
             specs: Default::default(),
             status: InstanceStatus::Active,
+            nlb_target_group_arn: "test-tg-arn".into(),
+            nlb_listener_arn: "test-listener-arn".into(),
         }
     }
 }
@@ -117,7 +132,7 @@ pub trait ServerProviderClient: Display {
 #[cfg(test)]
 pub mod test_client {
     use std::{fmt::Display, sync::Mutex};
-
+    use std::net::Ipv4Addr;
     use serde::Serialize;
 
     use super::{Instance, InstanceStatus, ServerProviderClient};
@@ -184,10 +199,14 @@ pub mod test_client {
             let instance = Instance {
                 id: id.to_string(),
                 region: region.into(),
-                main_ip: format!("0.0.0.{id}").parse().unwrap(),
+                main_ip: Ipv4Addr::LOCALHOST,
+                ssh_host: "127.0.0.1".to_string(),
+                ssh_port: 22,
                 tags: Vec::new(),
                 specs: self.settings.specs.clone(),
                 status: InstanceStatus::Active,
+                nlb_target_group_arn: "test-tg-arn".into(),
+                nlb_listener_arn: "test-listener-arn".into(),
             };
             guard.push(instance.clone());
             Ok(instance)

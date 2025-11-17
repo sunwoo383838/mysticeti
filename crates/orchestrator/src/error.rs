@@ -96,4 +96,7 @@ pub enum TestbedError {
 
     #[error(transparent)]
     MonitorError(#[from] MonitorError),
+
+    #[error("Async task join error: {0}")]
+    AsyncTaskJoinError(#[from] tokio::task::JoinError),
 }

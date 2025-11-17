@@ -36,5 +36,5 @@ serde_yaml = "0.9.34+deprecated"
 tokio = { version = "1", features = ["full"] }
 aws-config = "1.1"
 aws-sdk-ec2 = "~1.138.0"
-aws-sdk-globalaccelerator = "~1.15.0"
+aws-sdk-globalaccelerator = "1.15.0"
 shellexpand = "3.0"

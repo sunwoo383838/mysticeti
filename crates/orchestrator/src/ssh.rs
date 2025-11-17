@@ -1,12 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    io::Read,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{fs, io::Read, net::SocketAddr, path::{Path, PathBuf}, time::Duration};
 
 use futures::future::try_join_all;
 use ssh2::{Channel, Session};
@@ -123,6 +118,66 @@ impl SshConnectionManager {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
+    }
+
+    pub async fn upload<I, P1, P2>(
+        &self,
+        instances: I,
+        local_path: P1,
+        remote_path: P2,
+    ) -> SshResult<Vec<()>>
+    where
+        I: IntoIterator<Item = Instance>,
+        P1: AsRef<Path> + Send + 'static + Clone,
+        P2: AsRef<Path> + Send + 'static + Clone,
+    {
+        let handles = instances
+            .into_iter()
+            .map(|instance| {
+                let ssh_manager = self.clone();
+                let local_path = local_path.clone();
+                let remote_path = remote_path.clone();
+
+                tokio::spawn(async move {
+                    // 1. AGA를 통해 연결을 시도 (AGA DNS:9000+i)
+                    let connection = ssh_manager.connect(instance.ssh_address()).await?;
+
+                    // 2. 로컬 파일 크기를 가져옵니다. (블로킹 I/O가 아님)
+                    let local_file_size = fs::metadata(local_path.as_ref())
+                        .map_err(|e| SshError::ConnectionError {
+                            address: instance.ssh_address(),
+                            error: e
+                        })?.len();
+
+                    // 3. 블로킹 I/O인 SCP 전송을 블로킹 풀에서 실행합니다.
+                    tokio::task::spawn_blocking(move || {
+                        connection.upload(
+                            local_path.as_ref(),
+                            remote_path.as_ref(),
+                            local_file_size,
+                        )
+                    })
+                        .await
+                        .unwrap_or_else(|e| {
+                            let error_string = format!("Blocking task failed: {e}");
+                            let static_message = Box::leak(error_string.into_boxed_str());
+                            // 패닉 대신 세션 에러로 변환
+                            Err(SshError::SessionError {
+                                address: instance.ssh_address(),
+                                error: ssh2::Error::new(ssh2::ErrorCode::Session(-1),
+                                                        static_message,
+                                ),
+                            })
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        try_join_all(handles)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<SshResult<_>>()
     }
 
     /// Set the maximum number of times to retries to establish a connection and execute commands.
@@ -308,6 +363,44 @@ impl SshConnection {
             address,
             retries: 0,
         })
+    }
+
+    pub fn upload(
+        &self,
+        local_path: &Path,
+        remote_path: &Path,
+        file_size: u64,
+    ) -> SshResult<()> {
+        let mut error = None;
+        for _ in 0..self.retries + 1 {
+            // 0o644는 파일 권한 (rw-r--r--)
+            let mut remote_file = match self.session.scp_send(remote_path, 0o644, file_size, None) {
+                Ok(x) => x,
+                Err(e) => {
+                    error = Some(self.make_session_error(e));
+                    continue;
+                }
+            };
+
+            let mut local_file = fs::File::open(local_path)
+                .map_err(|e| self.make_connection_error(e))?;
+
+            // 파일을 청크 단위로 복사
+            match std::io::copy(&mut local_file, &mut remote_file) {
+                Ok(_) => {
+                    // SCP 세션 종료
+                    remote_file.send_eof().map_err(|e| self.make_session_error(e))?;
+                    remote_file.wait_eof().map_err(|e| self.make_session_error(e))?;
+                    remote_file.close().map_err(|e| self.make_session_error(e))?;
+                    remote_file.wait_close().map_err(|e| self.make_session_error(e))?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    error = Some(self.make_connection_error(e));
+                }
+            }
+        }
+        Err(error.unwrap())
     }
 
     /// Set a timeout for the ssh connection. If no timeouts are specified, reset it to the

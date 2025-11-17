@@ -4,7 +4,18 @@ cloud_provider: aws
 token_file: "/Users/${USER}/.aws/credentials"
 ssh_private_key_file: "/Users/${USER}/.ssh/aws"
 regions:
-  - us-west-1
+  # Virginia (버지니아) 설정
+  - name: "us-east-1"
+    aga_dns_name: "va-aga.awsglobalaccelerator.com" # <--- 미리 생성된 버지니아 AGA의 DNS
+    nlb_arn: "arn:aws:elasticloadbalancing:us-east-1:1234567890:loadbalancer/net/..." # <--- 미리 생성된 버지니아 NLB의 ARN
+  # Ohio (오하이오) 설정
+  - name: "us-east-2"
+    aga_dns_name: "oh-aga.awsglobalaccelerator.com"
+    nlb_arn: "arn:aws:elasticloadbalancing:us-east-2:1234567890:loadbalancer/net/..."
+  # Oregon (오레곤) 설정
+  - name: "us-west-2"
+    aga_dns_name: "or-aga.awsglobalaccelerator.com"
+    nlb_arn: "arn:aws:elasticloadbalancing:us-west-2:1234567890:loadbalancer/net/..."
 specs: m5d.8xlarge
 repository:
   url: https://github.com/asonnino/mysticeti.git

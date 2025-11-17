@@ -381,7 +381,7 @@ dependencies = [
  "aws-sdk-ssooidc",
  "aws-sdk-sts",
  "aws-smithy-async",
- "aws-smithy-http 0.60.8",
+ "aws-smithy-http 0.60.12",
  "aws-smithy-json 0.60.7",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
@@ -483,6 +483,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-elasticloadbalancingv2"
+version = "1.63.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5947e08ea90213f853305dd9ef3a7b49964768e17e95426f60973a3b1cf4b51b"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.60.12",
+ "aws-smithy-json 0.61.7",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "http 0.2.9",
+ "once_cell",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-globalaccelerator"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -491,7 +514,7 @@ dependencies = [
  "aws-credential-types",
  "aws-runtime",
  "aws-smithy-async",
- "aws-smithy-http 0.60.8",
+ "aws-smithy-http 0.60.12",
  "aws-smithy-json 0.60.7",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
@@ -514,7 +537,7 @@ dependencies = [
  "aws-credential-types",
  "aws-runtime",
  "aws-smithy-async",
- "aws-smithy-http 0.60.8",
+ "aws-smithy-http 0.60.12",
  "aws-smithy-json 0.60.7",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
@@ -536,7 +559,7 @@ dependencies = [
  "aws-credential-types",
  "aws-runtime",
  "aws-smithy-async",
- "aws-smithy-http 0.60.8",
+ "aws-smithy-http 0.60.12",
  "aws-smithy-json 0.60.7",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
@@ -558,7 +581,7 @@ dependencies = [
  "aws-credential-types",
  "aws-runtime",
  "aws-smithy-async",
- "aws-smithy-http 0.60.8",
+ "aws-smithy-http 0.60.12",
  "aws-smithy-json 0.60.7",
  "aws-smithy-query",
  "aws-smithy-runtime",
@@ -607,9 +630,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-http"
-version = "0.60.8"
+version = "0.60.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a7de001a1b9a25601016d8057ea16e31a45fdca3751304c8edf4ad72e706c08"
+checksum = "7809c27ad8da6a6a68c454e651d4962479e81472aa19ae99e59f9aba1f9713cc"
 dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -2887,6 +2910,8 @@ dependencies = [
  "aws-config",
  "aws-runtime",
  "aws-sdk-ec2",
+ "aws-sdk-elasticloadbalancingv2",
+ "aws-sdk-globalaccelerator",
  "clap",
  "color-eyre",
  "crossterm",
