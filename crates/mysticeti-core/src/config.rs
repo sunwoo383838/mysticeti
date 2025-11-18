@@ -45,7 +45,8 @@ pub mod ark_se_de_base64 {
         // 문자열로 받아서 Base64 디코딩
         let s: String = String::deserialize(d)?;
         let bytes = STANDARD.decode(s).map_err(D::Error::custom)?;
-        T::deserialize_with_mode(&bytes[..], Compress::Yes, Validate::Yes)
+        // ✅ 수정: Compress::No (비압축 모드)로 변경
+        T::deserialize_with_mode(&bytes[..], Compress::No, Validate::Yes)
             .map_err(D::Error::custom)
     }
 }
