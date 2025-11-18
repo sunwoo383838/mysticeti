@@ -1,8 +1,8 @@
 ---
 testbed_id: "mysticeti-vote-test"
 cloud_provider: aws
-token_file: "/Users/${USER}/.aws/credentials"
-ssh_private_key_file: "~/.ssh/aws-prover-key"
+token_file: "/root/.aws/credentials"
+ssh_private_key_file: "/root/.ssh/aws-prover-key"
 regions:
   # Virginia (버지니아) 설정
   - name: "us-east-1"
@@ -18,7 +18,7 @@ regions:
     nlb_arn: "arn:aws:elasticloadbalancing:us-west-2:286430881698:loadbalancer/net/mysticeti-nlb-oregon/7380f31b3b2aff67"
 specs: c8g.12xlarge
 repository:
-  url: https://github.com/asonnino/mysticeti.git
+  url: https://github.com/sunwoo383838/mysticeti.git
   commit: mysticeti-vote
 
 benchmark_duration: 60

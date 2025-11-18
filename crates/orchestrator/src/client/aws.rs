@@ -1,5 +1,4 @@
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// crates/orchestrator/src/client/aws.rs
 
 use std::{
     collections::HashMap,
@@ -15,8 +14,6 @@ use aws_sdk_ec2::{
     meta::PKG_VERSION,
     primitives::Blob,
     types::{
-        // EC2 인스턴스 생성을 위한 빌더 (v1.x SDK의 `builders`는 비공개 API에 가까움)
-        // 대신 타입 자체의 `builder()` 메서드를 사용합니다.
         BlockDeviceMapping,
         EbsBlockDevice,
         Filter,
@@ -27,12 +24,20 @@ use aws_sdk_ec2::{
         Tag,
         TagSpecification,
         VolumeType,
+        EphemeralNvmeSupport,
+        // --- ⬇️ 스팟 인스턴스를 위해 추가 ⬇️ ---
+        InstanceMarketOptionsRequest,
+        InstanceInterruptionBehavior,
+        MarketType,
+        SpotInstanceType,
+        SpotMarketOptions,
     },
 };
-use aws_sdk_ec2::types::{EphemeralNvmeSupport};
 // (신규) ELBv2(NLB) SDK 임포트
 use aws_sdk_elasticloadbalancingv2 as elbv2;
-use elbv2::types::{Action, ActionTypeEnum, ProtocolEnum, TargetDescription, TargetTypeEnum};
+// [ 🌟 수정 ] 헬스 체크 관련 Enum 및 타입을 모두 임포트합니다.
+use elbv2::types::{Action, ActionTypeEnum, ProtocolEnum, TargetDescription, TargetTypeEnum, TargetHealthStateEnum, TargetHealthDescription};
+use log::info;
 use serde::Serialize;
 use tokio::time::sleep; // (신규) 대기 시간을 위해 추가
 
@@ -70,8 +75,9 @@ impl Display for AwsClient {
 }
 
 impl AwsClient {
+    // [ 🌟 수정 ] arm64 AMI를 사용하도록 변경
     const OS_IMAGE: &'static str =
-        "Canonical, Ubuntu, 24.04 LTS, amd64 noble image build on 2024-04-23";
+        "Canonical, Ubuntu, 24.04 LTS, arm64 noble image build on 2024-04-23";
     const DEFAULT_EBS_SIZE_GB: i32 = 500; // Default size of the EBS volume in GB.
 
     /// Make a new AWS client.
@@ -291,9 +297,6 @@ impl AwsClient {
 
             let reservations = response.reservations.unwrap_or_default();
 
-            // 2. 이제 `reservations` 변수에서 데이터를 빌려옵니다.
-            //    `instance`는 `reservations`를 참조하며, `reservations`는
-            //    루프 반복이 끝날 때까지 살아있으므로 안전합니다.
             let instance = reservations
                 .first() // &Vec<Reservation> -> Option<&Reservation>
                 .and_then(|r| r.instances.as_ref()) // Option<&Reservation> -> Option<&Vec<AwsInstance>>
@@ -331,6 +334,61 @@ impl AwsClient {
                         state
                     )));
                 }
+            }
+        }
+    }
+
+    // [ 🌟 추가: NLB 헬스 체크 대기 함수 (오류 수정됨) ]
+    async fn wait_for_target_healthy(
+        &self,
+        elbv2_client: &elbv2::Client,
+        target_group_arn: &str,
+        instance_id: &str,
+    ) -> CloudProviderResult<()> {
+        info!("(AWS) [ID: {instance_id}] Waiting for NLB Target Group {target_group_arn} to become 'healthy'...");
+
+        loop {
+            // [ 🌟 수정 ] wrap_err를 제거하고 `?`를 사용하여 SdkError가 CloudProviderError로 변환되도록 함
+            let response = elbv2_client
+                .describe_target_health()
+                .target_group_arn(target_group_arn)
+                .targets(
+                    TargetDescription::builder()
+                        .id(instance_id)
+                        .build()
+                )
+                .send()
+                .await?; // 👈 [수정됨]
+
+            if let Some(desc) = response.target_health_descriptions.and_then(|mut v| v.pop()) {
+                if let Some(state) = desc.target_health.clone().and_then(|th| th.state) {
+                    match state {
+                        TargetHealthStateEnum::Healthy => {
+                            info!("(AWS) [ID: {instance_id}] Target is 'Healthy'.");
+                            return Ok(());
+                        }
+                        TargetHealthStateEnum::Unhealthy => {
+                            // [ 🌟 수정된 부분 🌟 ]
+                            // .and_then(|th| th.reason) 대신 .as_ref()를 두 번 사용하여
+                            // String의 소유권을 이동시키지 않고 참조(&String)를 가져옵니다.
+                            let reason = desc.target_health.as_ref() // Option<TargetHealth> -> Option<&TargetHealth>
+                                .and_then(|th| th.reason.as_ref()) // Option<&TargetHealth> -> Option<&String>
+                                .map_or("No reason provided", |s| s.as_str()); // |s|는 &String 타입
+
+                            info!("(AWS) [ID: {instance_id}] Target state is 'Unhealthy'. Reason: [{reason}]. Waiting 5s...");
+                        }
+                        TargetHealthStateEnum::Initial | TargetHealthStateEnum::Draining | TargetHealthStateEnum::Unavailable | TargetHealthStateEnum::Unused => {
+                            info!("(AWS) [ID: {instance_id}] Target state is '{:?}'. Waiting 5s...", state);
+                        }
+                        _ => {
+                            info!("(AWS) [ID: {instance_id}] Target state is '{:?}'. Waiting 5s...", state);
+                        }
+                    }
+                } else {
+                    info!("(AWS) [ID: {instance_id}] Target health description not yet available. Waiting 5s...");
+                }
+
+                sleep(Duration::from_secs(5)).await;
             }
         }
     }
@@ -539,6 +597,7 @@ impl ServerProviderClient for AwsClient {
             *port += 1; // 다음 포트를 위해 1 증가
             assigned_port
         };
+        info!("(AWS) [Region: {region}] Requesting instance with SSH port {assigned_port}");
 
         // 2. 보안 그룹 생성 (기존 로직)
         self.create_security_group(client).await?;
@@ -564,6 +623,17 @@ impl ServerProviderClient for AwsClient {
             )
             .build();
 
+        // [ 🌟 추가 ] 스팟 인스턴스 옵션
+        let spot_options = SpotMarketOptions::builder()
+            .spot_instance_type(SpotInstanceType::OneTime) // 1회성 요청
+            .instance_interruption_behavior(InstanceInterruptionBehavior::Terminate) // 중단 시 종료
+            .build();
+
+        let market_options = InstanceMarketOptionsRequest::builder()
+            .market_type(MarketType::Spot) // 마켓 타입을 'spot'으로 지정
+            .spot_options(spot_options)
+            .build();
+
         // 6. EC2 인스턴스 생성 요청
         let request = client
             .run_instances()
@@ -574,7 +644,9 @@ impl ServerProviderClient for AwsClient {
             .max_count(1)
             .security_groups(&self.settings.testbed_id)
             .block_device_mappings(storage)
-            .tag_specifications(tags);
+            .tag_specifications(tags)
+            .instance_market_options(market_options); // [ 🌟 추가 ] 스팟 옵션 적용
+
 
         let response = request.send().await?;
         let aws_instance_slim = &response
@@ -585,13 +657,18 @@ impl ServerProviderClient for AwsClient {
             .unwrap();
         let instance_id = aws_instance_slim.instance_id().unwrap();
 
+        info!("(AWS) [Region: {region}, Port: {assigned_port}] EC2 instance created: {instance_id}");
+
+        info!("(AWS) [Region: {region}, ID: {instance_id}] Waiting for instance to enter 'running' state...");
         // 7. (신규) EC2가 'running' 상태가 될 때까지 대기
         let vpc_id = self
             .wait_for_instance_running(client, instance_id)
             .await?;
+        info!("(AWS) [Region: {region}, ID: {instance_id}] Instance is 'running' in VPC {vpc_id}.");
 
         // 8. (신규) NLB 대상 그룹(Target Group) 생성
         let tg_name = format!("mysticeti-tg-{}-{}", region, assigned_port);
+        info!("(AWS) [Region: {region}, ID: {instance_id}] Creating NLB Target Group: {tg_name}"); // 👈 [로그 추가]
         let tg_response = elbv2_client
             .create_target_group()
             .name(tg_name)
@@ -599,6 +676,12 @@ impl ServerProviderClient for AwsClient {
             .port(22) // 대상은 EC2의 SSH 포트(22)
             .vpc_id(vpc_id)
             .target_type(TargetTypeEnum::Instance)
+            // --- ⬇️ 헬스 체크 설정을 명시적으로 추가 ⬇️ ---
+            .health_check_protocol(ProtocolEnum::Tcp) // [ 🌟 수정 ]
+            .health_check_port("22") // 헬스 체크도 22번 포트(SSH)로 수행
+            .health_check_interval_seconds(10) // 10초마다 헬스 체크
+            .healthy_threshold_count(2) // 2번 성공 시 'Healthy'
+            // --- ⬆️ 헬스 체크 설정 추가 끝 ⬆️ ---
             .send()
             .await?;
 
@@ -612,6 +695,7 @@ impl ServerProviderClient for AwsClient {
             .as_ref()
             .unwrap();
 
+        info!("(AWS) [Region: {region}, ID: {instance_id}] Registering instance to Target Group {target_group_arn}");
         // 9. (신규) 대상 그룹에 EC2 인스턴스 등록
         elbv2_client
             .register_targets()
@@ -624,7 +708,9 @@ impl ServerProviderClient for AwsClient {
             .send()
             .await?;
 
+        // [ 🌟 수정: 10번(리스너 생성)을 9.5번(헬스 체크 대기) 앞으로 이동 ]
         // 10. (신규) NLB에 리스너 생성 (AGA 포트 -> 대상 그룹)
+        info!("(AWS) [Region: {region}, ID: {instance_id}] Creating NLB Listener: Port {assigned_port} -> {target_group_arn}");
         let listener_response = elbv2_client
             .create_listener()
             .load_balancer_arn(&region_config.nlb_arn)
@@ -649,6 +735,11 @@ impl ServerProviderClient for AwsClient {
             .as_ref()
             .unwrap();
 
+        // [ 🌟 수정: 9.5번(헬스 체크 대기)을 10번 뒤로 이동 ]
+        // 9.5. NLB가 이 대상을 'Healthy'로 인식할 때까지 대기
+        self.wait_for_target_healthy(elbv2_client, target_group_arn, instance_id).await?;
+
+
         // 11. (수정) make_instance 호출
         // describe_instances를 다시 호출하여 전체 AwsInstance 정보를 가져옵니다.
         let full_aws_instance = client
@@ -666,6 +757,8 @@ impl ServerProviderClient for AwsClient {
             .first()
             .unwrap()
             .clone();
+
+        info!("(AWS) [Region: {region}, ID: {instance_id}] Successfully provisioned all resources.");
 
         Ok(self.make_instance(
             region,
@@ -690,6 +783,7 @@ impl ServerProviderClient for AwsClient {
 
         // (신규) 1. NLB 리스너 삭제
         // 오류가 발생해도 무시하고 다음 단계 진행 (정리 작업이므로)
+        info!("(AWS) [Region: {}] Deleting Listener: {}", instance.region, instance.nlb_listener_arn); // 👈 [로그 추가]
         if let Err(e) = elbv2_client
             .delete_listener()
             .listener_arn(&instance.nlb_listener_arn)
@@ -702,10 +796,12 @@ impl ServerProviderClient for AwsClient {
             );
         } else {
             // 리스너 삭제가 성공하면 대상 그룹 삭제 전에 잠시 대기
+            info!("(AWS) [Region: {}] Waiting 5s for listener deletion...", instance.region); // 👈 [로그 추가]
             sleep(Duration::from_secs(5)).await;
         }
 
         // (신규) 2. NLB 대상 그룹 삭제
+        info!("(AWS) [Region: {}] Deleting Target Group: {}", instance.region, instance.nlb_target_group_arn); // 👈 [로그 추가]
         if let Err(e) = elbv2_client
             .delete_target_group()
             .target_group_arn(&instance.nlb_target_group_arn)
@@ -720,6 +816,7 @@ impl ServerProviderClient for AwsClient {
         }
 
         // (기존) 3. EC2 인스턴스 종료
+        info!("(AWS) [Region: {}] Terminating Instance: {}", instance.region, instance.id); // 👈 [로그 추가]
         client
             .terminate_instances()
             .set_instance_ids(Some(vec![instance.id.clone()]))

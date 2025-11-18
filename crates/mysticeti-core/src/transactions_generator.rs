@@ -35,24 +35,26 @@ impl TransactionGenerator {
         node_public_config: NodePublicConfig,
         metrics: Arc<Metrics>,
     ) {
-        let file_path = format!("validator_{}_txs.bin", seed);
+        let home = dirs_next::home_dir().expect("Failed to get home directory");
+        let file_path = home.join("working_dir").join(format!("validator_{}_txs.bin", seed));
+        let file_path_str = file_path.display().to_string();
         let transactions = match File::open(&file_path) {
             Ok(mut file) => {
-                tracing::info!("Loading transactions from default file: {}", file_path);
+                tracing::info!("Loading transactions from default file: {}", file_path_str);
                 let mut buffer = Vec::new();
                 file.read_to_end(&mut buffer)
-                    .context(format!("Failed to read transaction file: {}", file_path))
+                    .context(format!("Failed to read transaction file: {}", file_path_str))
                     .expect("Cannot read transaction file. Exiting.");
                 let txs: Vec<Transaction> = bincode::deserialize(&buffer)
-                    .context(format!("Failed to deserialize transactions from '{}'. File is corrupt.", file_path))
+                    .context(format!("Failed to deserialize transactions from '{}'. File is corrupt.", file_path_str))
                     .expect("Cannot deserialize transaction file. Exiting.");
-                tracing::info!("Loaded {} transactions from {}.", txs.len(), file_path);
+                tracing::info!("Loaded {} transactions from {}.", txs.len(), file_path_str);
                 txs.into()
             }
             Err(e) => {
                 panic!(
                     "Failed to open transaction file '{}': {}. Cannot continue.",
-                    file_path, e
+                    file_path_str, e
                 )
             }
         };

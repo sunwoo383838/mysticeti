@@ -669,7 +669,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         display::config("Commit", format!("'{}'", &self.settings.repository.commit));
         display::newline();
 
-        let local_batch_files_path = Path::new("/benchmark_batches/n10_t7_k7000000");
+        let local_batch_files_path = Path::new("benchmark_batches/n10_t7_k7000000");
 
         // Cleanup the testbed (in case the previous run was not completed).
         self.cleanup(true).await?;

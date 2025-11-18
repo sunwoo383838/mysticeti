@@ -31,7 +31,8 @@ serde_yaml = "0.9.33"
 ssh2 = "0.9.4"                                                                                    # TODO: remove this dependency
 thiserror = "1.0.38"
 tokio = { workspace = true }
-
+log = "0.4.17"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] } # 👈 [이 줄을 추가]
 [dev-dependencies]
 tempfile = { workspace = true }
 

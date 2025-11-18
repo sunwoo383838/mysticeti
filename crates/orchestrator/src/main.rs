@@ -16,6 +16,7 @@ use settings::{CloudProvider, Settings};
 use ssh::SshConnectionManager;
 use testbed::Testbed;
 
+use tracing_subscriber::{filter::LevelFilter, fmt, EnvFilter};
 mod benchmark;
 mod client;
 mod display;
@@ -134,6 +135,10 @@ pub enum TestbedAction {
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+    fmt().with_env_filter(filter).init();
     let opts: Opts = Opts::parse();
 
     // Load the settings files.

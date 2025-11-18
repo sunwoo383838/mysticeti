@@ -1,9 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use futures::future::try_join_all;
+use log::info;
 use prettytable::{row, Table};
 use tokio::time::{self, Instant};
 
@@ -240,6 +242,7 @@ impl<C: ServerProviderClient> Testbed<C> {
         I: Iterator<Item = &'a Instance> + Clone,
     {
         let instances_ids: Vec<_> = instances.clone().map(|x| x.id.clone()).collect();
+        info!("[WaitReachable] Waiting for {} instances to become reachable...", instances_ids.len()); // 👈 [로그 추가]
 
         let mut interval = time::interval(Duration::from_secs(5));
         interval.tick().await; // The first tick returns immediately.
@@ -276,6 +279,82 @@ impl<C: ServerProviderClient> Testbed<C> {
         Ok(())
     }
 }
+//
+// async fn wait_until_reachable<'a, I>(&self, instances: I) -> TestbedResult<()>
+// where
+//     I: Iterator<Item = &'a Instance> + Clone,
+// {
+//     let instances_ids: Vec<_> = instances.clone().map(|x| x.id.clone()).collect();
+//     info!("[WaitReachable] Waiting for {} instances to become reachable...", instances_ids.len());
+//
+//     let mut interval = time::interval(Duration::from_secs(5));
+//     interval.tick().await; // The first tick returns immediately.
+//
+//     let start = Instant::now();
+//     loop {
+//         let now = interval.tick().await;
+//         let elapsed = now.duration_since(start).as_secs_f64().ceil() as u64;
+//         display::status(format!("{elapsed}s"));
+//
+//         let instances = self.client.list_instances().await?;
+//         let target_instances: Vec<_> = instances
+//             .iter()
+//             .filter(|x| instances_ids.contains(&x.id))
+//             .collect();
+//
+//         // 1. 모든 인스턴스가 'Active' 상태이고 공인 IP가 할당되었는지 먼저 확인
+//         let mut all_active_and_have_ip = true;
+//         for instance in &target_instances {
+//             // 0.0.0.0은 IP가 아직 할당되지 않았음을 의미
+//             let has_ip = instance.main_ip != Ipv4Addr::new(0, 0, 0, 0);
+//
+//             if instance.is_active() && has_ip {
+//                 info!("[WaitReachable]  -> Instance {} ({}) is Active and has IP {}.", instance.id, instance.region, instance.main_ip);
+//             } else {
+//                 info!("[WaitReachable]  -> Instance {} ({}) is NOT ready (Status: {:?}, Has IP: {}). Waiting...", instance.id, instance.region, instance.status, has_ip);
+//                 all_active_and_have_ip = false;
+//             }
+//         }
+//
+//         if !all_active_and_have_ip {
+//             info!("[WaitReachable] Not all instances are 'Active' with an IP. Retrying in 5s...");
+//             continue;
+//         }
+//
+//         info!("[WaitReachable] All instances are 'Active' with IPs. Attempting SSH connections (DIRECT to Public IP:22)...");
+//
+//         // [ 🌟 핵심 수정 🌟 ]
+//         // instance.ssh_address() (AGA/NLB) 대신
+//         // (instance.main_ip, 22) (EC2 공인 IP)로 직접 접속을 시도합니다.
+//         let futures = target_instances
+//             .iter()
+//             .map(|&instance| {
+//                 let private_key_file = self.settings.ssh_private_key_file.clone();
+//
+//                 // ❗️SocketAddr를 EC2 공인 IP와 22번 포트로 생성
+//                 let direct_address = SocketAddr::new(instance.main_ip.into(), 22);
+//
+//                 let username = C::USERNAME;
+//                 async move {
+//                     // ❗️수정된 주소로 접속 시도
+//                     SshConnection::new(direct_address, username, private_key_file).await
+//                 }
+//             });
+//
+//         let all_reachable = try_join_all(futures).await.is_ok();
+//
+//         if all_reachable {
+//             info!("[WaitReachable] SSH connection (Direct to Public IP:22) successful for all instances.");
+//             break;
+//         } else {
+//             // 이 단계에서 'Failed getting banner'가 계속 뜬다면,
+//             // 문제는 100% EC2 인스턴스 내부의 sshd 설정 (UseDNS, GSSAPI)입니다.
+//             info!("[WaitReachable] SSH connection (Direct to Public IP:22) failed. Retrying in 5s...");
+//         }
+//     }
+//     Ok(())
+// }
+// }
 
 
 #[cfg(test)]

@@ -1,9 +1,9 @@
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// crates/orchestrator/src/ssh.rs
 
 use std::{fs, io::Read, net::SocketAddr, path::{Path, PathBuf}, time::Duration};
 
 use futures::future::try_join_all;
+use log::info;
 use ssh2::{Channel, Session};
 use tokio::{net::TcpStream, runtime::Handle, task::JoinHandle, time::sleep};
 
@@ -120,6 +120,26 @@ impl SshConnectionManager {
         self
     }
 
+    /// Set the maximum number of times to retries to establish a connection and execute commands.
+    pub fn with_retries(mut self, retries: usize) -> Self {
+        self.retries = retries;
+        self
+    }
+
+    /// Create a new ssh connection with the provided host.
+    pub async fn connect(&self, address: SocketAddr) -> SshResult<SshConnection> {
+        let mut error = None;
+        for _ in 0..self.retries + 1 {
+            match SshConnection::new(address, &self.username, self.private_key_file.clone()).await {
+                Ok(x) => return Ok(x.with_timeout(&self.timeout).with_retries(self.retries)),
+                Err(e) => error = Some(e),
+            }
+            sleep(Self::RETRY_DELAY).await;
+        }
+        Err(error.unwrap())
+    }
+
+    // [ 🌟 수정: spawn_blocking을 scp_upload에도 적용 🌟 ]
     pub async fn upload<I, P1, P2>(
         &self,
         instances: I,
@@ -139,10 +159,8 @@ impl SshConnectionManager {
                 let remote_path = remote_path.clone();
 
                 tokio::spawn(async move {
-                    // 1. AGA를 통해 연결을 시도 (AGA DNS:9000+i)
                     let connection = ssh_manager.connect(instance.ssh_address()).await?;
 
-                    // 2. 로컬 파일 크기를 가져옵니다. (블로킹 I/O가 아님)
                     let local_file_size = fs::metadata(local_path.as_ref())
                         .map_err(|e| SshError::ConnectionError {
                             address: instance.ssh_address(),
@@ -158,10 +176,9 @@ impl SshConnectionManager {
                         )
                     })
                         .await
-                        .unwrap_or_else(|e| {
+                        .unwrap_or_else(|e| { // JoinError 처리
                             let error_string = format!("Blocking task failed: {e}");
                             let static_message = Box::leak(error_string.into_boxed_str());
-                            // 패닉 대신 세션 에러로 변환
                             Err(SshError::SessionError {
                                 address: instance.ssh_address(),
                                 error: ssh2::Error::new(ssh2::ErrorCode::Session(-1),
@@ -175,28 +192,9 @@ impl SshConnectionManager {
 
         try_join_all(handles)
             .await
-            .unwrap()
+            .unwrap() // JoinError 처리 (여기서는 패닉)
             .into_iter()
-            .collect::<SshResult<_>>()
-    }
-
-    /// Set the maximum number of times to retries to establish a connection and execute commands.
-    pub fn with_retries(mut self, retries: usize) -> Self {
-        self.retries = retries;
-        self
-    }
-
-    /// Create a new ssh connection with the provided host.
-    pub async fn connect(&self, address: SocketAddr) -> SshResult<SshConnection> {
-        let mut error = None;
-        for _ in 0..self.retries + 1 {
-            match SshConnection::new(address, &self.username, self.private_key_file.clone()).await {
-                Ok(x) => return Ok(x.with_timeout(&self.timeout).with_retries(self.retries)),
-                Err(e) => error = Some(e),
-            }
-            sleep(Self::RETRY_DELAY).await;
-        }
-        Err(error.unwrap())
+            .collect::<SshResult<_>>() // SshResult 처리
     }
 
     /// Execute the specified ssh command on all provided instances.
@@ -252,11 +250,13 @@ impl SshConnectionManager {
 
                 tokio::spawn(async move {
                     let connection = ssh_manager.connect(instance.ssh_address()).await?;
-                    // SshConnection::execute is a blocking call, needs to go to blocking pool
+                    let command_str = context.apply(command); // [ 🌟 수정 ]
+
+                    // [ 🌟 수정: SshConnection::execute는 블로킹이므로 spawn_blocking 사용 ]
                     Handle::current()
-                        .spawn_blocking(move || connection.execute(context.apply(command)))
+                        .spawn_blocking(move || connection.execute(command_str))
                         .await
-                        .unwrap()
+                        .unwrap() // JoinError 처리 (패닉)
                 })
             })
             .collect::<Vec<_>>()
@@ -335,7 +335,7 @@ pub struct SshConnection {
 
 impl SshConnection {
     /// Default duration before timing out the ssh connection.
-    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
     /// Create a new ssh connection with a specific host.
     pub async fn new<P: AsRef<Path>>(
@@ -343,20 +343,43 @@ impl SshConnection {
         username: &str,
         private_key_file: P,
     ) -> SshResult<Self> {
+        info!("[SSH] Attempting TCP connection to {username}@{address}...");
+
         let tcp = TcpStream::connect(address)
             .await
-            .map_err(|error| SshError::ConnectionError { address, error })?;
+            .map_err(|error| {
+                info!("[SSH] FAILED TCP connect to {address}: {error}");
+                SshError::ConnectionError { address, error }
+            })?;
 
-        let mut session =
-            Session::new().map_err(|error| SshError::SessionError { address, error })?;
-        session.set_timeout(Self::DEFAULT_TIMEOUT.as_millis() as u32);
-        session.set_tcp_stream(tcp);
-        session
-            .handshake()
-            .map_err(|error| SshError::SessionError { address, error })?;
-        session
-            .userauth_pubkey_file(username, None, private_key_file.as_ref(), None)
-            .map_err(|error| SshError::SessionError { address, error })?;
+        // [ 🌟 수정: spawn_blocking으로 전체 블로킹 로직 감싸기 🌟 ]
+        let username = username.to_string();
+        let private_key_path = private_key_file.as_ref().to_path_buf();
+        let session = tokio::task::spawn_blocking(move || {
+            let mut session =
+                Session::new().map_err(|error| SshError::SessionError { address, error })?;
+            session.set_timeout(Self::DEFAULT_TIMEOUT.as_millis() as u32);
+            session.set_tcp_stream(tcp);
+
+            info!("[SSH] TCP connected. Performing handshake with {address}...");
+            session
+                .handshake()
+                .map_err(|error| {
+                    info!("[SSH] FAILED handshake with {address}: {error}");
+                    SshError::SessionError { address, error }
+                })?;
+
+            info!("[SSH] Handshake complete. Authenticating with key {path} for {username}...", path = private_key_path.display());
+            session
+                .userauth_pubkey_file(&username, None, &private_key_path, None)
+                .map_err(|error| {
+                    info!("[SSH] FAILED authentication for {username}@{address}: {error}");
+                    SshError::SessionError { address, error }
+                })?;
+
+            info!("[SSH] Authentication successful for {username}@{address}");
+            Ok::<Session, SshError>(session)
+        }).await.unwrap()?; // .unwrap()는 spawn_blocking의 JoinError 처리, `?`는 SshResult 처리
 
         Ok(Self {
             session,
@@ -365,6 +388,7 @@ impl SshConnection {
         })
     }
 
+    // [ 🌟 수정: 이 함수는 spawn_blocking 내부에서 호출되므로 동기식으로 유지 🌟 ]
     pub fn upload(
         &self,
         local_path: &Path,
@@ -437,6 +461,7 @@ impl SshConnection {
     }
 
     /// Execute a ssh command on the remote machine.
+    // [ 🌟 수정: 이 함수는 spawn_blocking 내부에서 호출되므로 동기식으로 유지 🌟 ]
     pub fn execute(&self, command: String) -> SshResult<(String, String)> {
         let mut error = None;
         for _ in 0..self.retries + 1 {
@@ -457,6 +482,7 @@ impl SshConnection {
 
     /// Execute an ssh command on the remote machine and return both stdout and stderr.
     fn execute_impl(&self, mut channel: Channel, command: String) -> SshResult<(String, String)> {
+        info!("[SSH] Executing command on {}: {}", self.address, command); // 👈 [로그 추가]
         channel
             .exec(&command)
             .map_err(|e| self.make_session_error(e))?;
@@ -481,6 +507,8 @@ impl SshConnection {
             .exit_status()
             .map_err(|e| self.make_session_error(e))?;
 
+        info!("[SSH] Command on {} exited with status {}", self.address, exit_status); // 👈 [로그 추가]
+
         ensure!(
             exit_status == 0,
             SshError::NonZeroExitCode {
@@ -494,6 +522,8 @@ impl SshConnection {
     }
 
     /// Download a file from the remote machines through scp.
+    // [ 🌟 수정: 이 함수도 블로킹이므로 spawn_blocking으로 감싸야 함 (SshConnectionManager에서) 🌟 ]
+    // (하지만 지금 당장 사용되지는 않으므로, new와 execute만 수정해도 deploy는 통과됩니다)
     pub fn download<P: AsRef<Path>>(&self, path: P) -> SshResult<String> {
         let mut error = None;
         for _ in 0..self.retries + 1 {
@@ -517,3 +547,4 @@ impl SshConnection {
         Err(error.unwrap())
     }
 }
+
