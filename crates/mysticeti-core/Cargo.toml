@@ -11,6 +11,7 @@ dirs-next = "2.0"
 
 crypto = { path = "../crypto" }
 
+rayon = "1.10"  # <-- 이 줄을 추가하세요
 
 ark-std = { version = "0.5.0", features = ["std", "getrandom"] }
 ark-ff = "0.5.0"
