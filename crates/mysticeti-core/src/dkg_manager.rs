@@ -90,31 +90,36 @@ impl DkgManager {
     }
 
     pub async fn start_dkg(&mut self) {
-        if !matches!(self.state, DkgState::Idle) {
-            tracing::warn!("DKG가 이미 시작되었거나 완료되었습니다.");
-            return;
-        }
+        match self.state {
+            DkgState::Idle | DkgState::AwaitingCommitments(_) => {
+                let global_seed = self.global_seed;
+                let mut rng = get_dkg_rng_for_participant(global_seed, self.my_index);
 
-        let global_seed = self.global_seed;
-        let mut rng = get_dkg_rng_for_participant(global_seed, self.my_index);
+                tracing::info!("[DKG] 1단계: (t={}, n={}) 셰어 및 커밋 생성 중...", self.t, self.n);
+                let my_secret_contribution = JubJubFr::rand(&mut rng);
+                let (shares, _, commits) =
+                    shamir_split_with_commitments(my_secret_contribution, self.t, self.n, self.g, &mut rng);
 
-        tracing::info!("[DKG] 1단계: (t={}, n={}) 셰어 및 커밋 생성 중...", self.t, self.n);
-        let my_secret_contribution = JubJubFr::rand(&mut rng);
-        let (shares, _, commits) =
-            shamir_split_with_commitments(my_secret_contribution, self.t, self.n, self.g, &mut rng);
+                self.my_shares_to_send = shares;
+                self.my_commits = commits.clone();
 
-        self.my_shares_to_send = shares;
-        self.my_commits = commits.clone();
+                tracing::info!("[DKG] 1단계: 생성된 커밋 브로드캐스트...");
+                let msg = NetworkMessage::DkgCommitment(commits.clone());
+                for (peer_id, sender) in &self.network_senders {
+                    if let Err(e) = sender.send(msg.clone()).await {
+                        tracing::warn!("[DKG] {peer_id}번 피어에게 커밋 전송 실패: {e}");
+                    }
+                }
 
-        tracing::info!("[DKG] 1단계: 생성된 커밋 브로드캐스트...");
-        let msg = NetworkMessage::DkgCommitment(commits.clone());
-        for (peer_id, sender) in &self.network_senders {
-            if let Err(e) = sender.send(msg.clone()).await {
-                tracing::warn!("[DKG] {peer_id}번 피어에게 커밋 전송 실패: {e}");
+                self.handle_commitment(self.my_index, self.my_commits.clone());
+            }
+            _ => {
+                tracing::warn!("DKG가 이미 시작되었거나 완료되었습니다.");
+                return;
             }
         }
 
-        self.handle_commitment(self.my_index, self.my_commits.clone());
+
     }
 
     pub fn handle_commitment(&mut self, sender_auth: AuthorityIndex, commits: Vec<JubJubAffine>) {

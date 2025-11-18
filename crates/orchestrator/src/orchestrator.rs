@@ -338,51 +338,37 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
 
     /// Update all instances to use the version of the codebase specified in the setting file.
     pub async fn update(&self) -> TestbedResult<()> {
-        display::action("Updating all instances by uploading local binary");
+        display::action("Updating all instances");
 
-        // [설정] 로컬 바이너리 위치
-        // 주의: 원격 서버(AWS EC2 c8g 등) 아키텍처에 맞는 바이너리여야 합니다.
-        // 예: 로컬이 Mac/Windows라면 크로스 컴파일 필요 (target/aarch64-unknown-linux-gnu/release/mysticeti)
-        // 여기서는 기본 릴리즈 경로를 가정합니다. 필요시 경로를 수정하세요.
-        let local_binary_path = Path::new("target/release/mysticeti");
+        // Update all active instances. This requires compiling the codebase in release (which
+        // may take a long time) so we run the command in the background to avoid keeping alive
+        // many ssh connections for too long.
+        let commit = &self.settings.repository.commit;
+        let command = [
+            &format!("git fetch origin"),
+            &format!("git reset --hard origin/{commit}"),            "source $HOME/.cargo/env",
+            "RUSTFLAGS=-Ctarget-cpu=native cargo build --release",
+        ]
+        .join(" && ");
 
-        // 로컬 바이너리 존재 확인
-        if !local_binary_path.exists() {
-            return Err(TestbedError::SettingsError(
-                crate::error::SettingsError::InvalidSettings {
-                    file: local_binary_path.display().to_string(),
-                    message: "Local binary not found. Please build it first (e.g., cargo build --release).".to_string(),
-                }
-            ));
-        }
+        let active = self.instances.iter().filter(|x| x.is_active()).cloned();
 
-        // 원격 서버 저장 경로
-        // Mysticeti 프로토콜이 실행 시 참조하는 경로("target/release")에 맞춰줍니다.
-        let remote_dir = Path::new("target/release");
-        let remote_binary_path = remote_dir.join("mysticeti");
-
-        let active_instances: Vec<_> = self.instances.iter().filter(|x| x.is_active()).cloned().collect();
-
-        // 1. 원격 디렉토리 생성 (mkdir -p target/release)
-        let mkdir_command = format!("mkdir -p {}", remote_dir.display());
+        let id = "update";
+        let repo_name = self.settings.repository_name();
+        let context = CommandContext::new()
+            .run_background(id.into())
+            .with_log_file(format!("~/{id}.log").into()) // <--- 로그 파일 생성!
+            .with_execute_from_path(repo_name.clone().into());
+        let context = CommandContext::new()
+            .run_background(id.into())
+            .with_execute_from_path(repo_name.into());
         self.ssh_manager
-            .execute(active_instances.clone(), mkdir_command, CommandContext::default())
+            .execute(active.clone(), command, context)
             .await?;
 
-        // 2. 바이너리 파일 업로드 (SCP)
-        // ssh_manager.upload는 내부적으로 spawn_blocking을 사용해 병렬 전송을 처리합니다.
+        // Wait until the command finished running.
         self.ssh_manager
-            .upload(
-                active_instances.clone(),
-                local_binary_path.to_path_buf(), // 또는 .clone()
-                remote_binary_path.clone()       // [핵심 수정] & 제거 및 clone() 추가
-            )
-            .await?;
-
-        // 3. 실행 권한 부여 (chmod +x)
-        let chmod_command = format!("chmod +x {}", remote_binary_path.display());
-        self.ssh_manager
-            .execute(active_instances, chmod_command, CommandContext::default())
+            .wait_for_command(active, id, CommandStatus::Terminated)
             .await?;
 
         display::done();
