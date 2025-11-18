@@ -5,6 +5,7 @@ use std::{cmp::min, sync::Arc, time::Duration};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use eyre::Context;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -39,16 +40,14 @@ impl TransactionGenerator {
         let home = dirs_next::home_dir().expect("Failed to get home directory");
         let file_path = home.join("working_dir").join(format!("validator_{}_txs.bin", seed));
         let file_path_str = file_path.display().to_string();
-        // [수정된 로직 시작]
+
         let transactions = match File::open(&file_path) {
             Ok(file) => {
                 tracing::info!("Loooooading transactions from file: {}", file_path_str);
 
-                // 1. BufReader 사용: 파일을 통째로 메모리에 올리지 않고 버퍼링하여 읽음 (메모리 절약)
                 let reader = BufReader::new(file);
 
-                // 2. Deserialize: VoteTransaction 벡터로 역직렬화
-                // (bincode는 구조상 직렬화는 단일 스레드여야 하므로 이 부분은 유지)
+                // 1. Deserialize (이 부분은 직렬 처리라 시간 좀 걸림)
                 let vote_txs: Vec<VoteTransaction> = bincode::deserialize_from(reader)
                     .context(format!("Failed to deserialize transactions from '{}'.", file_path_str))
                     .expect("Cannot deserialize transaction file. Exiting.");
@@ -58,13 +57,25 @@ impl TransactionGenerator {
                     vote_txs.len()
                 );
 
-                // 3. Parallel Convert: Rayon을 사용하여 모든 코어에서 병렬 변환 수행 (속도 핵심)
-                // .into_iter() -> .into_par_iter() 로 변경
+                // 2. [수정] 진행 상황 확인용 Atomic Counter 생성
+                let progress_counter = AtomicUsize::new(0);
+
+                // 3. Parallel Convert
                 let txs: Vec<Transaction> = vote_txs
                     .into_par_iter()
                     .map(|vt| {
-                        Transaction::new_vote(&vt)
-                            .expect("Failed to create Transaction from VoteTransaction")
+                        let tx = Transaction::new_vote(&vt)
+                            .expect("Failed to create Transaction from VoteTransaction");
+
+                        // [수정] 카운터 증가 및 로그 출력
+                        // fetch_add는 이전 값을 반환하므로 1을 더해 현재 값으로 만듦
+                        let count = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        if count % 100_000 == 0 {
+                            tracing::info!("Converted {} transactions...", count);
+                        }
+
+                        tx
                     })
                     .collect();
 
@@ -78,7 +89,6 @@ impl TransactionGenerator {
                 )
             }
         };
-        // [수정된 로직 끝]
 
         tracing::info!("트랜잭션 준비 완료, 제너레이터 시작");
         runtime::Handle::current().spawn(
