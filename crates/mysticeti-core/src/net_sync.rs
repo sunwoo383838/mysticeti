@@ -92,7 +92,6 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
         let (stop_sender, stop_receiver) = mpsc::channel(1);
         stop_sender.try_send(()).unwrap(); // occupy the only available permit, so that all other calls to send() will block
         let (epoch_sender, epoch_receiver) = mpsc::channel(1);
-        epoch_sender.try_send(()).unwrap(); // occupy the only available permit, so that all other calls to send() will block
         let inner = Arc::new(NetworkSyncerInner {
             notify,
             syncer,
