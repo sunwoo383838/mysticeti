@@ -42,7 +42,7 @@ impl TransactionGenerator {
         // [수정된 로직 시작]
         let transactions = match File::open(&file_path) {
             Ok(file) => {
-                tracing::info!("Loading transactions from file: {}", file_path_str);
+                tracing::info!("Loooooading transactions from file: {}", file_path_str);
 
                 // 1. BufReader 사용: 파일을 통째로 메모리에 올리지 않고 버퍼링하여 읽음 (메모리 절약)
                 let reader = BufReader::new(file);

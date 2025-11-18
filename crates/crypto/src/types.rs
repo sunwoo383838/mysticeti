@@ -24,7 +24,7 @@ pub mod ark_se_de_as_bytes {
         T: CanonicalDeserialize,
     {
         let bytes: Vec<u8> = serde_bytes::Deserialize::deserialize(d)?;
-        T::deserialize_with_mode(&bytes[..], Compress::Yes, Validate::Yes)
+        T::deserialize_with_mode(&bytes[..], Compress::Yes, Validate::No)
             .map_err(Error::custom)
     }
 }
