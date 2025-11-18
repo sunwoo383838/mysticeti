@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use ark_bls12_381::Bls12_381;
 use ark_groth16::VerifyingKey;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -17,6 +18,37 @@ use crate::{
     crypto::{dummy_signer, Signer},
     types::{AuthorityIndex, PublicKey, RoundNumber},
 };
+
+pub mod ark_se_de_base64 {
+    use super::*;
+    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
+    use serde::{Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S, T>(val: &T, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: CanonicalSerialize,
+    {
+        let mut bytes = Vec::new();
+        val.serialize_with_mode(&mut bytes, Compress::Yes)
+            .map_err(serde::ser::Error::custom)?;
+        // Base64 문자열로 인코딩하여 직렬화
+        let encoded = STANDARD.encode(bytes);
+        s.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D, T>(d: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: CanonicalDeserialize,
+    {
+        // 문자열로 받아서 Base64 디코딩
+        let s: String = String::deserialize(d)?;
+        let bytes = STANDARD.decode(s).map_err(D::Error::custom)?;
+        T::deserialize_with_mode(&bytes[..], Compress::Yes, Validate::Yes)
+            .map_err(D::Error::custom)
+    }
+}
 
 pub trait ImportExport: Serialize + DeserializeOwned {
     fn load<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
@@ -266,7 +298,7 @@ pub struct CryptoConfig {
     pub merkle_root: String,
     #[serde(default = "crypto_defaults::default_global_seed")]
     pub global_seed: u64,
-    #[serde(default = "crypto_defaults::default_verifying_key", with = "ark_se_de_as_bytes")]
+    #[serde(default = "crypto_defaults::default_verifying_key", with = "ark_se_de_base64")]
     pub verifying_key: VerifyingKey<Bls12_381>,
 }
 

@@ -16,9 +16,12 @@ regions:
   - name: "us-west-2"
     aga_dns_name: "a740353730ac140f5.awsglobalaccelerator.com"
     nlb_arn: "arn:aws:elasticloadbalancing:us-west-2:286430881698:loadbalancer/net/mysticeti-nlb-oregon/7380f31b3b2aff67"
-specs: c8g.12xlarge
+specs: c7g.2xlarge
 repository:
   url: https://github.com/sunwoo383838/mysticeti.git
   commit: mysticeti-vote
 
 benchmark_duration: 60
+node_parameters_path: "crates/orchestrator/assets/node-parameters.yml"
+working_dir: "/home/ubuntu/working_dir"
+ssh_start_port: 9004

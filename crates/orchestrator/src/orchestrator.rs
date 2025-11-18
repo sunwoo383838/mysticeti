@@ -191,6 +191,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             // TODO: Remove libssl-dev dependency #7
             "sudo apt-get -y install build-essential sysstat iftop libssl-dev",
             "sudo apt-get -y install linux-tools-common linux-tools-generic pkg-config",
+            "sudo apt-get -y install build-essential sysstat iftop libssl-dev clang",
             // Install rust (non-interactive).
             "curl --proto \"=https\" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
             "echo \"source $HOME/.cargo/env\" | tee -a ~/.bashrc",
@@ -288,16 +289,39 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             // 업로드 작업을 SshConnectionManager를 통해 실행합니다. (AGA 가속 채널 사용)
             let manager = self.ssh_manager.clone();
 
-            // tokio::spawn을 사용하여 블로킹 SCP 호출을 풀링 스레드에서 실행
             tokio::spawn(async move {
-                display::status(format!("Uploading to {} (Port: {})", instance.id, instance.ssh_port));
+                // 1. 원격 서버에 파일이 있는지 확인 (test -f 명령어 사용)
+                let remote_path_str = remote_path.display().to_string();
+                let check_cmd = format!("test -f {}", remote_path_str);
 
-                // SshConnectionManager::upload 호출
-                manager.upload(
-                    std::iter::once(instance),
-                    local_path,
-                    remote_path
-                ).await?;
+                // execute 함수는 exit status가 0(성공)이 아니면 Err를 반환합니다.
+                // 따라서 Ok면 파일이 존재, Err면 파일이 없음(혹은 접속 오류)입니다.
+                let file_exists = manager
+                    .execute(
+                        std::iter::once(instance.clone()),
+                        check_cmd,
+                        CommandContext::default()
+                    )
+                    .await
+                    .is_ok();
+
+                if file_exists {
+                    // 2. 파일이 있으면 로그만 찍고 스킵
+                    display::status(format!(
+                        "Skipping upload to {} (File already exists: {})",
+                        instance.id,
+                        remote_path.file_name().unwrap().to_string_lossy()
+                    ));
+                } else {
+                    // 3. 파일이 없으면 업로드 수행
+                    display::status(format!("Uploading to {} (Port: {})", instance.id, instance.ssh_port));
+
+                    manager.upload(
+                        std::iter::once(instance),
+                        local_path,
+                        remote_path
+                    ).await?;
+                }
 
                 Ok(())
             }).into()
@@ -321,9 +345,8 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         // many ssh connections for too long.
         let commit = &self.settings.repository.commit;
         let command = [
-            &format!("git fetch origin {commit}"),
-            &format!("(git checkout -b {commit} || git checkout -f origin/{commit})"),
-            "source $HOME/.cargo/env",
+            &format!("git fetch origin"),
+            &format!("git reset --hard origin/{commit}"),            "source $HOME/.cargo/env",
             "RUSTFLAGS=-Ctarget-cpu=native cargo build --release",
         ]
         .join(" && ");
@@ -332,6 +355,10 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
 
         let id = "update";
         let repo_name = self.settings.repository_name();
+        let context = CommandContext::new()
+            .run_background(id.into())
+            .with_log_file(format!("~/{id}.log").into()) // <--- 로그 파일 생성!
+            .with_execute_from_path(repo_name.clone().into());
         let context = CommandContext::new()
             .run_background(id.into())
             .with_execute_from_path(repo_name.into());
