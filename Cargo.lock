@@ -1454,6 +1454,7 @@ dependencies = [
  "crypto",
  "eyre",
  "futures",
+ "mysticeti-core",
  "rayon",
  "serde",
  "serde_json",

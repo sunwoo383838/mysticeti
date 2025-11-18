@@ -21,7 +21,7 @@ repository:
   url: https://github.com/sunwoo383838/mysticeti.git
   commit: mysticeti-vote
 
-benchmark_duration: 60
+benchmark_duration: 180
 node_parameters_path: "crates/orchestrator/assets/node-parameters.yml"
 working_dir: "/home/ubuntu/working_dir"
 ssh_start_port: 9004

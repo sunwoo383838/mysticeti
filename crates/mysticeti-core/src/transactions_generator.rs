@@ -8,7 +8,7 @@ use std::io::Read;
 use eyre::Context;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use tokio::sync::mpsc;
-
+use crypto::types::VoteTransaction;
 use crate::{
     config::{ClientParameters, NodePublicConfig},
     crypto::AsBytes,
@@ -45,9 +45,17 @@ impl TransactionGenerator {
                 file.read_to_end(&mut buffer)
                     .context(format!("Failed to read transaction file: {}", file_path_str))
                     .expect("Cannot read transaction file. Exiting.");
-                let txs: Vec<Transaction> = bincode::deserialize(&buffer)
+
+                // [수정됨] 무조건 Vec<VoteTransaction>으로 역직렬화 시도
+                let vote_txs: Vec<VoteTransaction> = bincode::deserialize(&buffer)
                     .context(format!("Failed to deserialize transactions from '{}'. File is corrupt.", file_path_str))
                     .expect("Cannot deserialize transaction file. Exiting.");
+
+                // [수정됨] VoteTransaction -> Transaction 변환
+                let txs: Vec<Transaction> = vote_txs.into_iter()
+                    .map(|vt| Transaction::new_vote(&vt).expect("Failed to create Transaction from VoteTransaction"))
+                    .collect();
+
                 tracing::info!("Loaded {} transactions from {}.", txs.len(), file_path_str);
                 txs.into()
             }
@@ -66,7 +74,7 @@ impl TransactionGenerator {
                 node_public_config,
                 metrics,
             }
-            .run(),
+                .run(),
         );
     }
 
