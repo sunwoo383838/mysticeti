@@ -158,6 +158,7 @@ impl ProtocolCommands for MysticetiProtocol {
                 let crypto_config_path = self.working_dir.join("crypto-config.yaml");
 
                 let run = [
+                    "RUST_LOG=info,mysticeti_core=debug,mysticeti=debug",
                     &format!("./{BINARY_PATH}/mysticeti"),
                     "run",
                     &format!("--authority {authority}"),

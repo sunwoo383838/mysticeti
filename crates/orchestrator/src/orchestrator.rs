@@ -200,7 +200,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             // Create the working directory.
             &format!("mkdir -p {working_dir}"),
             // Clone the repo.
-            &format!("(git clone {url} || true)"),
+            &format!("(git clone {url})"),
         ];
 
         let command = [

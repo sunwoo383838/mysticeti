@@ -283,29 +283,51 @@ impl AwsClient {
         Ok(false)
     }
 
+    // crates/orchestrator/src/client/aws.rs
+
     async fn wait_for_instance_running(
         &self,
         client: &aws_sdk_ec2::Client,
         instance_id: &str,
     ) -> CloudProviderResult<String> {
         loop {
-            let response = client
+            // [수정] describe_instances 호출을 match로 감싸서 NotFound 에러 처리
+            let response = match client
                 .describe_instances()
                 .instance_ids(instance_id)
                 .send()
-                .await?;
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // 에러 메시지를 문자열로 변환하여 확인
+                    let err_debug = format!("{:?}", e);
+
+                    // "InvalidInstanceID.NotFound" 에러는 AWS 전파 지연이므로 재시도
+                    if err_debug.contains("InvalidInstanceID.NotFound") {
+                        info!("(AWS) Instance {instance_id} ID not yet visible. Retrying in 2s...");
+                        sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+
+                    // 그 외의 진짜 에러는 반환
+                    return Err(e.into());
+                }
+            };
 
             let reservations = response.reservations.unwrap_or_default();
 
             let instance = reservations
-                .first() // &Vec<Reservation> -> Option<&Reservation>
-                .and_then(|r| r.instances.as_ref()) // Option<&Reservation> -> Option<&Vec<AwsInstance>>
-                .and_then(|i| i.first()) // Option<&Vec<AwsInstance>> -> Option<&AwsInstance>
-                .ok_or_else(|| {
-                    CloudProviderError::UnexpectedResponse(format!(
-                        "Instance {instance_id} not found after creation"
-                    ))
-                })?;
+                .first()
+                .and_then(|r| r.instances.as_ref())
+                .and_then(|i| i.first());
+
+            // 인스턴스 정보가 비어있을 경우 재시도
+            if instance.is_none() {
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            let instance = instance.unwrap();
 
             let state = instance
                 .state
@@ -328,6 +350,7 @@ impl AwsClient {
                 InstanceStateName::Pending => {
                     sleep(Duration::from_secs(5)).await;
                 }
+                // 그 외 비정상 상태 (Terminated 등) 처리
                 _ => {
                     return Err(CloudProviderError::UnexpectedResponse(format!(
                         "Instance {instance_id} entered unexpected state: {:?}",
@@ -734,11 +757,6 @@ impl ServerProviderClient for AwsClient {
             .listener_arn
             .as_ref()
             .unwrap();
-
-        // [ 🌟 수정: 9.5번(헬스 체크 대기)을 10번 뒤로 이동 ]
-        // 9.5. NLB가 이 대상을 'Healthy'로 인식할 때까지 대기
-        self.wait_for_target_healthy(elbv2_client, target_group_arn, instance_id).await?;
-
 
         // 11. (수정) make_instance 호출
         // describe_instances를 다시 호출하여 전체 AwsInstance 정보를 가져옵니다.

@@ -188,7 +188,6 @@ impl Validator {
             tx_sender_for_generator,
             authority,
             client_parameters,
-            public_config.clone(),
             metrics.clone(),
         );
 

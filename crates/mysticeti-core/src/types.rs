@@ -6,6 +6,7 @@ pub type AuthorityIndex = u64;
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Transaction {
     data: Vec<u8>,
+    pub timestamp: u64,
 }
 
 pub type TransactionID = [u8; 32];
@@ -618,12 +619,18 @@ impl fmt::Display for BaseStatement {
 
 impl Transaction {
     pub fn new(data: Vec<u8>) -> Self {
-        Self { data }
+        Self {
+            data,
+            timestamp: 0
+        }
     }
 
     pub fn new_vote(vote_tx: &VoteTransaction) -> Result<Self, bincode::Error> {
         let serialized_data = bincode::serialize(vote_tx)?;
-        Ok(Self { data: serialized_data })
+        Ok(Self {
+            data: serialized_data,
+            timestamp: 0, // 생성 시점에는 0으로 초기화
+        })
     }
 
     pub fn get_vote(&self) -> Result<VoteTransaction, bincode::Error> {

@@ -335,7 +335,7 @@ pub struct SshConnection {
 
 impl SshConnection {
     /// Default duration before timing out the ssh connection.
-    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 
     /// Create a new ssh connection with a specific host.
     pub async fn new<P: AsRef<Path>>(

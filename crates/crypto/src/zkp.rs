@@ -193,6 +193,7 @@ pub fn setup(
     merkle_height: usize,
     committee_pk: PublicKey<JubJub>,
     elgamal_generator: JubJubAffine,
+    election_id: Fr,
 ) -> ZkResult<(ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>)> {
 
     assert!(merkle_height >= 1, "merkle_height must be >= 1 for this setup path");
@@ -224,7 +225,7 @@ pub fn setup(
         vote_bits: vec![false; num_candidates],
         encryption_rand: JubJubFr::zero(),
 
-        election_id: Fr::zero(),
+        election_id,
         voter_set_root: root,
         nullifier: Fr::zero(),
         enc_vote_vec: vec![Ciphertext::<JubJub>::default(); num_candidates],

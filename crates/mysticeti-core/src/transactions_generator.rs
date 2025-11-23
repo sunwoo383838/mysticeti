@@ -23,7 +23,6 @@ pub struct TransactionGenerator {
     sender: mpsc::Sender<Vec<Transaction>>,
     transactions: VecDeque<Transaction>,
     client_parameters: ClientParameters,
-    node_public_config: NodePublicConfig,
     metrics: Arc<Metrics>,
 }
 
@@ -34,7 +33,6 @@ impl TransactionGenerator {
         sender: mpsc::Sender<Vec<Transaction>>,
         seed: AuthorityIndex,
         client_parameters: ClientParameters,
-        node_public_config: NodePublicConfig,
         metrics: Arc<Metrics>,
     ) {
         let home = dirs_next::home_dir().expect("Failed to get home directory");
@@ -96,7 +94,6 @@ impl TransactionGenerator {
                 sender,
                 transactions,
                 client_parameters,
-                node_public_config,
                 metrics,
             }
                 .run(),
@@ -127,7 +124,8 @@ impl TransactionGenerator {
             let mut block= Vec::with_capacity(transactions_per_block_interval);
 
             for _ in 0..transactions_per_block_interval {
-                if let Some(tx) = self.transactions.pop_front() {
+                if let Some(mut tx) = self.transactions.pop_front() {
+                    tx.timestamp = timestamp_utc().as_millis() as u64;
                     block.push(tx);
                     total_sent_in_batch += 1;
                 } else {
@@ -150,9 +148,6 @@ impl TransactionGenerator {
     }
 
     pub fn extract_timestamp(transaction: &Transaction) -> Duration {
-        let bytes = transaction.as_bytes()[0..8]
-            .try_into()
-            .expect("Transactions should be at least 8 bytes");
-        Duration::from_millis(u64::from_le_bytes(bytes))
+        Duration::from_millis(transaction.timestamp)
     }
 }

@@ -87,10 +87,10 @@ pub struct Settings {
     /// The cloud provider hosting the testbed.
     pub cloud_provider: CloudProvider,
     /// The path to the secret token for authentication with the cloud provider.
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub token_file: PathBuf,
     /// The ssh private key to access the instances.
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub ssh_private_key_file: PathBuf,
     /// The corresponding ssh public key registered on the instances. If not specified. the
     /// public key defaults the same path as the private key with an added extension 'pub'.
