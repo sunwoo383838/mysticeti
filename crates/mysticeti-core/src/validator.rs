@@ -8,6 +8,7 @@ use std::{
 
 use ::prometheus::Registry;
 use ark_ed_on_bls12_381::{EdwardsAffine, Fr};
+use ark_groth16::prepare_verifying_key;
 use eyre::{eyre, Context, Result};
 use tokio::sync::{Mutex, Notify};
 use crate::{block_handler, block_handler::{RealBlockHandler, CommitHandler}, block_store::BlockStore, committee::Committee, config::{ClientParameters, NodePrivateConfig, NodePublicConfig}, core::{Core, CoreOptions}, log::TransactionLog, metrics::Metrics, net_sync::NetworkSyncer, network::Network, prometheus, runtime::{JoinError, JoinHandle}, transactions_generator::TransactionGenerator, types::AuthorityIndex, wal::{self, walf}};
@@ -72,7 +73,6 @@ impl Validator {
         // TransactionGenerator가 트랜잭션을 보낼 Sender(tx_sender_for_generator)와
         // Mempool의 dispatch_loop 태스크 핸들(mempool_handle)을 반환받습니다.
         let (mempool, tx_sender_for_generator, mempool_handle) = Mempool::new(
-            &public_config.parameters,
             metrics.clone(),
             nullifier_db.clone(),
             crypto_config.clone(),   // 🌟 crypto_config 전달
@@ -140,6 +140,8 @@ impl Validator {
             metrics.clone(),
             &public_config,
             dkg_manager.clone(),
+            crypto_config,
+            nullifier_db.clone(),
         );
 
         let core_syncer_handle = network_synchronizer.core_syncer_handle(); // CoreThreadDispatcher 핸들 복제

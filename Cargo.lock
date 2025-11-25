@@ -1345,6 +1345,7 @@ dependencies = [
  "ark-serialize",
  "ark-std",
  "bincode",
+ "rayon",
  "serde",
  "serde_bytes",
  "thiserror 2.0.17",

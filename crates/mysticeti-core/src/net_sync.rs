@@ -9,12 +9,17 @@ use std::{
     },
     time::Duration,
 };
+use std::str::FromStr;
+use ark_bls12_381::{Bls12_381, Fr};
 use ark_crypto_primitives::encryption::elgamal::Ciphertext;
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ed_on_bls12_381::{EdwardsAffine as JubJubAffine, EdwardsProjective as JubJub, Fr};
+use ark_ed_on_bls12_381::{EdwardsAffine as JubJubAffine, EdwardsProjective as JubJub, Fr as JubJubFr};
 use ark_ff::Zero;
+use ark_groth16::{prepare_verifying_key, PreparedVerifyingKey};
 use ark_serialize::{serialize_to_vec, CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
+use eyre::eyre;
 use futures::future::join_all;
+use rayon::prelude::*;
 use tokio::{
     select,
     sync::{mpsc, oneshot, Notify},
@@ -24,6 +29,7 @@ use tokio::task::spawn_blocking;
 use crypto::elgamal;
 use crypto::elgamal::decode_vote;
 use crypto::types::ZKElgamalCiphertext;
+use crypto::zkp::{batch_verify, prepare_public_inputs};
 use crate::{
     block_handler::BlockHandler,
     block_store::BlockStore,
@@ -39,8 +45,11 @@ use crate::{
     types::{format_authority_index, AuthorityIndex},
     wal::WalSyncer,
 };
+use crate::config::CryptoConfig;
+use crate::data::Data;
 use crate::dkg_manager::DkgManager;
-use crate::types::Transaction;
+use crate::nullifier::NullifierDB;
+use crate::types::{BaseStatement, StatementBlock, Transaction};
 
 /// The maximum number of blocks that can be requested in a single message.
 pub const MAXIMUM_BLOCK_REQUEST: usize = 10;
@@ -60,18 +69,23 @@ pub struct NetworkSyncerInner<H: BlockHandler> {
     stop: mpsc::Sender<()>,
     epoch_close_signal: mpsc::Sender<()>,
     pub epoch_closing_time: Arc<AtomicU64>,
-    dkg_manager: Arc<Mutex<DkgManager>>
+    dkg_manager: Arc<Mutex<DkgManager>>,
+    prepared_verifying_key: PreparedVerifyingKey<Bls12_381>,
+    crypto_config: CryptoConfig,
+    nullifier_db: Arc<NullifierDB>
 }
 
 impl<H: BlockHandler + 'static> NetworkSyncer<H> {
     pub fn start(
         network: Network,
-        mut core: Core<H>,
+        core: Core<H>,
         commit_period: u64,
         shutdown_grace_period: Duration,
         metrics: Arc<Metrics>,
         public_config: &NodePublicConfig,
         dkg_manager: Arc<Mutex<DkgManager>>,
+        crypto_config: CryptoConfig,
+        nullifier_db: Arc<NullifierDB>
     ) -> Self {
         let authority_index = core.authority();
         let handle = Handle::current();
@@ -92,6 +106,7 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
         let (stop_sender, stop_receiver) = mpsc::channel(1);
         stop_sender.try_send(()).unwrap(); // occupy the only available permit, so that all other calls to send() will block
         let (epoch_sender, epoch_receiver) = mpsc::channel(1);
+        let prepared_verifying_key = prepare_verifying_key(&crypto_config.verifying_key);
         let inner = Arc::new(NetworkSyncerInner {
             notify,
             syncer,
@@ -100,7 +115,10 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
             stop: stop_sender.clone(),
             epoch_close_signal: epoch_sender,
             epoch_closing_time,
-            dkg_manager
+            dkg_manager,
+            prepared_verifying_key,
+            crypto_config,
+            nullifier_db
         });
         let block_fetcher = Arc::new(BlockFetcher::start(
             authority_index,
@@ -251,6 +269,17 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
                         // Terminate connection upon receiving incorrect block.
                         break;
                     }
+
+                    if let Err(e) = Self::verify_block_batch(inner.clone(), block.clone()).await {
+                        tracing::warn!(
+                            "Rejected invalid block content (ZK/Nullifier fail) {} from {}: {:?}",
+                            block.reference(),
+                            peer,
+                            e
+                        );
+                        break;
+                    }
+                    
                     inner.syncer.add_blocks(vec![block]).await;
                 }
                 NetworkMessage::RequestBlocks(references) => {
@@ -279,7 +308,7 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
                 NetworkMessage::PartialDecryptionShare(share_bytes) => {
                     // ❗ DkgManager 락을 잡고 *동기* 함수 호출
                     inner.dkg_manager.lock().await
-                        .handle_partial_decryption(id, share_bytes);
+                        .handle_partial_decryption(id, share_bytes).await;
                 }
             }
         }
@@ -481,7 +510,76 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
             .unwrap()
     }
 
-    async fn perform_partial_decryption(ciphertext: &[u8], share: &Fr) -> Vec<u8> {
+    pub async fn verify_block_batch(
+        inner: Arc<NetworkSyncerInner<H>>,
+        block: Data<StatementBlock>
+    ) -> eyre::Result<()> {
+        spawn_blocking(move || {
+            let mut vote_txs = Vec::new();
+            let mut nullifiers = Vec::new();
+
+            if vote_txs.is_empty() {
+                return Ok(());
+            }
+
+            for statement in block.statements() {
+                if let BaseStatement::Share(tx) = statement {
+                    let vote_tx = match tx.get_vote() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!("Transaction deserialize failed: {e}");
+                            return Err(eyre!("rejected_deserialize"));
+                        }
+                    };
+                    if vote_tx.enc_vote_vec.len() != inner.crypto_config.num_candidates {
+                        tracing::warn!("Invalid candidate count");
+                        return Err(eyre!("rejected_zk_candidates"));
+                    }
+                    nullifiers.push(vote_tx.nullifier);
+                    vote_txs.push(vote_tx);
+                }
+            }
+
+            let merkle_root = Fr::from_str(&inner.crypto_config.merkle_root).unwrap();
+            let prepare_results: Result<Vec<_>, _> = vote_txs.par_iter()
+                .map(|tx| {
+                    prepare_public_inputs(
+                        &tx.enc_vote_vec,
+                        merkle_root,
+                        tx.nullifier
+                    )
+                })
+                .collect();
+
+            let public_inputs = match prepare_results {
+                Ok(inputs) => inputs,
+                Err(e) => return Err(eyre!("ZK input preparation failed: {:?}", e)),
+            };
+
+            let proofs: Vec<_> = vote_txs.iter().map(|tx| tx.proof.clone()).collect();
+            let zk_valid = batch_verify(
+                &inner.prepared_verifying_key,
+                &proofs,
+                &public_inputs
+            ).map_err(|e| eyre!("ZK verification error: {:?}", e))?;
+
+            if !zk_valid {
+                tracing::warn!("Invalid ZK Batch Proof in block {}", block.reference());
+                return Err(eyre!("rejected_zk_invalid_batch_proof"));
+            }
+
+            let db_valid = inner.nullifier_db.verify_batch(&nullifiers)
+                .map_err(|e| eyre!("Nullifier DB error: {:?}", e))?;
+            if !db_valid {
+                tracing::warn!("Block contains duplicate nullifiers: {}", block.reference());
+                return Err(eyre!("rejected_nullifier_duplicate"));
+            }
+            Ok(())
+        }).await?
+    }
+
+
+    async fn perform_partial_decryption(ciphertext: &[u8], share: &JubJubFr) -> Vec<u8> {
         let share = *share;
         let ciphertext = ciphertext.to_vec();
 
@@ -610,6 +708,7 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
 }
 
 impl<H: BlockHandler + 'static> NetworkSyncerInner<H> {
+
     // Returns None either if channel is closed or NetworkSyncerInner receives stop signal
     async fn recv_or_stopped<T>(&self, channel: &mut mpsc::Receiver<T>) -> Option<T> {
         select! {

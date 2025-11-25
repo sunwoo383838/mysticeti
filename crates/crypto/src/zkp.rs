@@ -1,3 +1,4 @@
+use std::ops::{Mul, Neg};
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_crypto_primitives::crh::{CRHScheme, CRHSchemeGadget, TwoToOneCRHScheme};
 use ark_crypto_primitives::crh::poseidon::{TwoToOneCRH, CRH};
@@ -8,11 +9,13 @@ use ark_crypto_primitives::merkle_tree::{Config, IdentityDigestConverter, Path};
 use ark_crypto_primitives::merkle_tree::constraints::{ConfigGadget, PathVar};
 use ark_crypto_primitives::snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_crypto_primitives::sponge::poseidon::{find_poseidon_ark_and_mds, PoseidonConfig};
+use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
+use ark_ec::pairing::Pairing;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_ed_on_bls12_381::{EdwardsAffine as JubJubAffine, EdwardsProjective as JubJub, Fr as JubJubFr};
 use ark_ed_on_bls12_381::constraints::EdwardsVar;
-use ark_ff::{BigInteger, PrimeField, ToConstraintField, Zero};
-use ark_groth16::{Groth16, Proof, ProvingKey, VerifyingKey};
+use ark_ff::{BigInteger, Field, PrimeField, ToConstraintField, Zero};
+use ark_groth16::{Groth16, PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
 use ark_groth16::r1cs_to_qap::LibsnarkReduction;
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::boolean::Boolean;
@@ -24,7 +27,10 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisE
 use ark_relations::r1cs::Result as R1CSResult;
 use ark_std::rand::rngs::StdRng;
 use ark_std::rand::{CryptoRng, RngCore, SeedableRng};
+use ark_std::{One, UniformRand};
+use rayon::prelude::*;
 use thiserror::Error;
+use crate::types::ZKElgamalCiphertext;
 
 #[derive(Debug, Error)]
 pub enum ZkError {
@@ -306,24 +312,11 @@ pub fn prove<R: RngCore + CryptoRng>(
 pub fn verify(
     vk: &VerifyingKey<Bls12_381>,
     proof: &Proof<Bls12_381>,
-    enc_vote_vec: &Vec<Ciphertext<JubJub>>,
+    enc_vote_vec: &[ZKElgamalCiphertext],
     voter_set_root: Fr,
     nullifier: Fr,
 ) -> R1CSResult<bool> {
-    let mut public_inputs = Vec::with_capacity(4 * enc_vote_vec.len() + 2);
-
-    for ct in enc_vote_vec {
-        public_inputs.extend(
-            ToConstraintField::<Fr>::to_field_elements(&ct.0)
-                .ok_or(SynthesisError::AssignmentMissing)?,
-        );
-        public_inputs.extend(
-            ToConstraintField::<Fr>::to_field_elements(&ct.1)
-                .ok_or(SynthesisError::AssignmentMissing)?,
-        );
-    }
-    public_inputs.push(voter_set_root);
-    public_inputs.push(nullifier);
+    let public_inputs = prepare_public_inputs(enc_vote_vec, voter_set_root, nullifier).unwrap();
 
     let result = Groth16::<Bls12_381, LibsnarkReduction>::verify(
         vk,
@@ -332,6 +325,111 @@ pub fn verify(
     )?;
     Ok(result)
 }
+
+pub fn prepare_public_inputs(
+    enc_vote_vec: &[ZKElgamalCiphertext],
+    voter_set_root: Fr,
+    nullifier: Fr,
+) -> R1CSResult<Vec<Fr>> {
+    let mut public_inputs = Vec::with_capacity(4 * enc_vote_vec.len() + 2);
+
+    for ct in enc_vote_vec {
+        public_inputs.extend(
+            ToConstraintField::<Fr>::to_field_elements(&ct.c1)
+                .ok_or(SynthesisError::AssignmentMissing)?,
+        );
+        public_inputs.extend(
+            ToConstraintField::<Fr>::to_field_elements(&ct.c2)
+                .ok_or(SynthesisError::AssignmentMissing)?,
+        );
+    }
+    public_inputs.push(voter_set_root);
+    public_inputs.push(nullifier);
+
+    Ok(public_inputs)
+}
+
+pub fn batch_verify(
+    pvk: &PreparedVerifyingKey<Bls12_381>,
+    proofs: &[Proof<Bls12_381>],
+    public_inputs: &[Vec<Fr>],
+) -> R1CSResult<bool> {
+    // 1. 기본 검증
+    if proofs.len() != public_inputs.len() {
+        return Err(SynthesisError::Unsatisfiable);
+    }
+    if proofs.is_empty() {
+        return Ok(true);
+    }
+
+    let mut rng = StdRng::from_entropy();
+
+    // 2. 랜덤 스칼라 r_i 생성
+    let randomizers: Vec<Fr> = (0..proofs.len())
+        .map(|_| Fr::rand(&mut rng))
+        .collect();
+
+    // total_r = sum(r_i)
+    let total_r: Fr = randomizers.iter().copied().sum();
+
+    // 3. Public Input 스칼라 집계 (Scalar Aggregation)
+    //    열(column) 단위로 합산: sum(r_i * x_ij)
+    let num_inputs = public_inputs[0].len();
+    let aggregated_inputs: Vec<Fr> = (0..num_inputs)
+        .into_par_iter()
+        .map(|j| {
+            public_inputs
+                .iter()
+                .zip(&randomizers)
+                .map(|(inputs, r)| inputs[j] * *r)
+                .sum()
+        })
+        .collect();
+
+    // 4. L_sum 계산 (prepare_inputs 재활용 + G0 보정)
+    //    L_sum = G_0 * (sum(r) - 1) + prepare_inputs(sum(r*x))
+    //    (참고: prepare_inputs는 내부적으로 G_0를 한 번 더하므로, 보정값은 total_r - 1 임)
+    let mut g_ic_proj = Groth16::<Bls12_381, LibsnarkReduction>::prepare_inputs(pvk, &aggregated_inputs)?;
+    let g0 = pvk.vk.gamma_abc_g1[0];
+    let adjustment = g0.mul(total_r - Fr::one());
+    let g_ic_prepared: <Bls12_381 as Pairing>::G1Prepared = (g_ic_proj + adjustment).into_affine().into();
+    // 5. C_sum 계산: sum(r_i * C_i) (MSM 활용)
+    let c_points: Vec<_> = proofs.iter().map(|p| p.c).collect();
+    let c_sum = <Bls12_381 as Pairing>::G1::msm(&c_points, &randomizers).unwrap();
+
+    // 6. A_i 처리: sum(e(r_i * A_i, B_i))
+    //    A_i에 r_i를 곱함
+    let scaled_a: Vec<_> = proofs
+        .par_iter()
+        .zip(&randomizers)
+        .map(|(p, r)| p.a.mul(*r).into_affine())
+        .collect();
+
+    // 7. Multi-Miller Loop 수행
+    //    좌변 = prod( e(rA, B) ) * e(L_sum, -gamma) * e(C_sum, -delta)
+    let ml_result = Bls12_381::multi_miller_loop(
+        scaled_a.iter()
+            .map(|a| <Bls12_381 as Pairing>::G1Prepared::from(*a))
+            .chain(std::iter::once(g_ic_prepared)) // 이미 Prepared
+            .chain(std::iter::once(<Bls12_381 as Pairing>::G1Prepared::from(c_sum.into_affine()))),
+
+        proofs.iter()
+            .map(|p| <Bls12_381 as Pairing>::G2Prepared::from(p.b)) // [핵심] 변환 추가
+            .chain(std::iter::once(pvk.gamma_g2_neg_pc.clone()))
+            .chain(std::iter::once(pvk.delta_g2_neg_pc.clone())),
+    );
+
+    // Final Exponentiation으로 GT 원소로 변환
+    let lhs = Bls12_381::final_exponentiation(ml_result).ok_or(SynthesisError::UnexpectedIdentity)?.0;
+
+    // 8. 우변 계산: (alpha * beta)^(sum r_i)
+    //    pvk.alpha_g1_beta_g2는 이미 e(alpha, beta) 값임
+    let rhs = pvk.alpha_g1_beta_g2.pow(total_r.into_bigint());
+
+    // 9. 비교: 좌변 == 우변
+    Ok(lhs == rhs)
+}
+
 
 
 

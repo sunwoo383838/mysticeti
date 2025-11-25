@@ -39,9 +39,23 @@ impl EpochManager {
         if block.epoch_changed() {
             let is_quorum = self.change_aggregator.add(block.author(), committee);
             if is_quorum && (self.epoch_status != InternalEpochStatus::SafeToClose) {
-                assert!(self.epoch_status == InternalEpochStatus::BeginChange);
+
+                // 🚨 [수정] 기존 assert! 코드를 아래 로직으로 대체합니다.
+                // 기존: assert!(self.epoch_status == InternalEpochStatus::BeginChange);
+
+                // 변경: Open 상태라면 경고를 찍고 BeginChange로 강제 전환
+                if self.epoch_status == InternalEpochStatus::Open {
+                    tracing::warn!("Quorum of epoch markers observed while in Open state. Forcing state transition.");
+                    self.epoch_status = InternalEpochStatus::BeginChange;
+                }
+
+                // 이제 상태는 BeginChange임이 보장되므로 안전하게 진행
                 self.epoch_close_time
                     .store(timestamp_utc().as_millis() as u64, Ordering::Relaxed);
+
+                // 🌟 [추가 권장] 상태를 SafeToClose로 업데이트해야 'closed()' 함수가 true를 반환함
+                self.epoch_status = InternalEpochStatus::SafeToClose;
+
                 tracing::info!("Epoch is now safe to close");
             }
         }

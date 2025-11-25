@@ -22,7 +22,6 @@ use crate::types::Transaction;
 pub struct Mempool {
     verified_pool: Arc<Mutex<VecDeque<Transaction>>>,
     metrics: Arc<Metrics>,
-    max_block_size: usize,
     nullifier_db: Arc<NullifierDB>,
     shutdown_signal: Arc<Notify>,
     crypto_config: CryptoConfig,
@@ -30,7 +29,6 @@ pub struct Mempool {
 
 impl Mempool {
     pub fn new(
-        parameters: &NodeParameters,
         metrics: Arc<Metrics>,
         nullifier_db: Arc<NullifierDB>,
         crypto_config: CryptoConfig,
@@ -44,7 +42,6 @@ impl Mempool {
             verified_pool: verified_pool.clone(),
             metrics,
             nullifier_db,
-            max_block_size: parameters.max_block_size,
             shutdown_signal: shutdown_signal.clone(),
             crypto_config,
         });
@@ -228,15 +225,10 @@ fn verify(
         return Err("rejected_zk_candidates");
     }
 
-    let enc_vote_vec: Vec<Ciphertext<JubJub>> = vote_tx.enc_vote_vec
-        .iter()
-        .map(|zk_ct| (zk_ct.c1, zk_ct.c2))
-        .collect();
-
     let verification_result = crypto::zkp::verify(
         &verifying_key,
         &vote_tx.proof,
-        &enc_vote_vec,
+        &vote_tx.enc_vote_vec,
         *merkle_root,
         vote_tx.nullifier
     );

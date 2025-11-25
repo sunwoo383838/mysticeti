@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 use ark_ed_on_bls12_381::Fr;
+use ark_groth16::prepare_verifying_key;
 use futures::future::join_all;
 use prometheus::Registry;
 use rand::{rngs::StdRng, SeedableRng};
@@ -296,6 +297,8 @@ pub async fn network_syncers_with_epoch_duration(
             dkg_complete_notify.clone(),
             &crypto_config,
         )));
+        let nullifier_db = Arc::new(NullifierDB::new(core.metrics.clone())
+            .expect("Failed to open NullifierDB"));
 
         // ❗ NetworkSyncer::start 시그니처 변경
         let network_syncer = NetworkSyncer::start(
@@ -307,6 +310,8 @@ pub async fn network_syncers_with_epoch_duration(
             test_metrics(),
             &NodePublicConfig::new_for_tests(n),
             dkg_manager, // ❗ dkg_manager 전달
+            crypto_config,
+            nullifier_db.clone()
         );
         network_syncers.push(network_syncer);
     }

@@ -9,6 +9,7 @@ ark-ff = "0.5.0"
 ark-ec = "0.5.0"
 ark-serialize = { version = "0.5.0", default-features = false, features = ["derive"] }
 ark-ed-on-bls12-381 = { version = "0.5.0", default-features = false, features = ["r1cs"] }
+rayon = "1.10.0"
 
 ark-bls12-381 = { version = "0.5.0", default-features = false, features = ["curve"] }
 ark-groth16 = "0.5.0"

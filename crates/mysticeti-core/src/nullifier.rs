@@ -57,6 +57,45 @@ impl NullifierDB {
         })
     }
 
+    pub fn verify_batch(
+        &self,
+        nullifiers: &[Fr],
+    ) -> Result<bool> {
+        let cf = self
+            .db
+            .cf_handle(CF_NULLIFIER)
+            .ok_or_else(|| eyre!("CF_NULLIFIER not found"))?;
+
+        let keys: Vec<Vec<u8>> = nullifiers.iter()
+            .map(|nf| serialize_to_vec![*nf].unwrap())
+            .collect();
+
+        let results = self.db.multi_get_cf(keys.iter().map(|k| (cf, k)));
+
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(Some(_)) => {
+                    tracing::warn!("Duplicate nullifier found in batch at index {}", i);
+                    return Ok(false);
+                }
+                Ok(None) => {
+                    continue;
+                }
+                Err(e) => return Err(eyre!("RocksDB error: {}", e)),
+            }
+        }
+
+        let mut batch = WriteBatchWithTransaction::<true>::default();
+        let locked_state = bincode::serialize(&NullifierState::Locked)?;
+
+        for key in keys {
+            batch.put_cf(&cf, key, &locked_state);
+        }
+
+        self.db.write(batch)?;
+        Ok(true)
+    }
+
     pub fn verify(
         &self,
         nullifier: Fr,
@@ -154,9 +193,9 @@ impl NullifierDB {
             .ok_or_else(|| eyre!("CF_NULLIFIER not found"))?;
 
         let mut batch = WriteBatchWithTransaction::<true>::default();
+        let new_state = NullifierState::Commit;
         for nullifier in nullifiers {
             let key = serialize_to_vec![nullifier]?;
-            let new_state = NullifierState::Commit;
             let value = bincode::serialize(&new_state)?;
             batch.put_cf(&cf, &key, &value);
         }
