@@ -34,6 +34,9 @@ pub struct Measurement {
     count: usize,
     /// Sum of the squares of the latencies of all finalized transactions
     squared_sum: f64,
+    /// [Modified] Accumulated CPU usage in seconds (from node_cpu_seconds_total).
+    #[serde(default)]
+    pub cpu_accumulated_seconds: f64,
 }
 
 impl Measurement {
@@ -45,12 +48,17 @@ impl Measurement {
 
         let mut measurements = HashMap::new();
         for sample in &parsed.samples {
-            let label = sample
-                .labels
-                .values()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",");
+            // [Modified] Use "system" label for CPU metrics, otherwise use existing label logic
+            let label = if sample.metric == "node_cpu_seconds_total" {
+                "system".to_string()
+            } else {
+                sample
+                    .labels
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
 
             let measurement = measurements
                 .entry(label.clone())
@@ -84,6 +92,16 @@ impl Measurement {
                         _ => panic!("Unexpected scraped value: '{x}'"),
                     };
                 }
+                // [Modified] CPU metric parsing logic
+                x if x == "node_cpu_seconds_total" => {
+                    if let prometheus_parse::Value::Counter(val) = sample.value {
+                        // Exclude 'idle' mode to capture active CPU usage (user + system + ...)
+                        let is_idle = sample.labels.get("mode").map(|s| s == "idle").unwrap_or(false);
+                        if !is_idle {
+                            measurement.cpu_accumulated_seconds += val;
+                        }
+                    }
+                },
                 _ => (),
             }
 
@@ -297,6 +315,7 @@ mod test {
             sum: Duration::from_secs(2),
             count: 100,
             squared_sum: 0.0,
+            cpu_accumulated_seconds: 0.0,
         };
 
         assert_eq!(data.average_latency(), Duration::from_millis(20));
@@ -310,6 +329,7 @@ mod test {
             sum: Duration::from_secs(50),
             count: 100,
             squared_sum: 75.0,
+            cpu_accumulated_seconds: 0.0,
         };
 
         // squared_sum / count
@@ -411,9 +431,9 @@ mod test {
                 ("90".into(), 1860),
                 ("inf".into(), 1860)
             ])
-            .iter()
-            .cloned()
-            .collect()
+                .iter()
+                .cloned()
+                .collect()
         );
         assert_eq!(data.sum.as_secs(), 1265);
         assert_eq!(data.count, 1860);

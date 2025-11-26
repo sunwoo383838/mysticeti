@@ -102,6 +102,55 @@ def aggregate_p_latency(measurement, workload, p=50, i=-1):
 
     return sum(latency) / len(latency) if latency else 0
 
+# [Added] Function to calculate average CPU usage over a steady state period
+def aggregate_cpu_usage(measurement, warm_up_sec=60, cores=32):
+    if 'system' not in measurement['data']:
+        return 0, 0
+
+    node_cpu_avgs = []
+
+    for scraper_id, data_points in measurement['data']['system'].items():
+        data_points.sort(key=lambda x: float(x['timestamp']['secs']))
+
+        if not data_points:
+            continue
+
+        start_time = float(data_points[0]['timestamp']['secs'])
+        valid_points = []
+
+        # Filter out warm-up period
+        for p in data_points:
+            t = float(p['timestamp']['secs'])
+            if t >= start_time + warm_up_sec:
+                valid_points.append(p)
+
+        if len(valid_points) < 2:
+            continue
+
+        first = valid_points[0]
+        last = valid_points[-1]
+
+        # Calculate usage based on accumulated CPU seconds and elapsed time
+        delta_cpu = float(last['cpu_accumulated_seconds']) - float(first['cpu_accumulated_seconds'])
+        delta_time = float(last['timestamp']['secs']) - float(first['timestamp']['secs'])
+
+        if delta_time > 0:
+            # Normalize by number of cores to get percentage (0-100%)
+            avg_usage = (delta_cpu / delta_time / cores) * 100
+            node_cpu_avgs.append(avg_usage)
+
+    if not node_cpu_avgs:
+        return 0, 0
+
+    # Calculate global average across all nodes
+    global_avg = sum(node_cpu_avgs) / len(node_cpu_avgs)
+
+    # Calculate standard deviation
+    variance = sum((x - global_avg) ** 2 for x in node_cpu_avgs) / len(node_cpu_avgs)
+    stdev = math.sqrt(variance)
+
+    return global_avg, stdev
+
 
 class PlotType(Enum):
     L_GRAPH = 1
@@ -456,6 +505,117 @@ class Plotter:
         self._plot(plot_tps_data, PlotType.DURATION_TPS)
         self._plot(plot_lat_data, PlotType.DURATION_LATENCY)
 
+    # [Added] Plot TPS vs Average CPU Usage
+    def plot_tps_cpu(self, workload, cores):
+        plot_data = []
+        transaction_size = self.parameters.transaction_size
+
+        for n in self.parameters.nodes:
+            for f in self.parameters.faults:
+                filename = self._file_format(transaction_size, f, n, '*')
+                measurements = self._load_measurement_data(filename)
+
+                x_values = []
+                y_values = []
+                y_err = []
+
+                measurements.sort(key=lambda x: x['parameters']['load'])
+
+                for m in measurements:
+                    # Use the first workload specified to calculate TPS for the X-axis
+                    real_tps = aggregate_tps(m, workload[0])
+                    avg_cpu, stdev_cpu = aggregate_cpu_usage(m, warm_up_sec=60, cores=cores)
+
+                    if real_tps > 0:
+                        x_values.append(real_tps)
+                        y_values.append(avg_cpu)
+                        y_err.append(stdev_cpu)
+
+                if x_values:
+                    id = MeasurementId(measurements[0], workload[0])
+                    plot_data.append((id, x_values, y_values, y_err))
+
+        self._plot_cpu(plot_data)
+
+    def _plot_cpu(self, data):
+        plt.figure(figsize=(6.4, 4.8))
+        markers = cycle(['o', 'v', 's', 'p', 'D', 'P'])
+
+        for id, x, y, err in data:
+            # Label for legend: "N nodes"
+            label = f"{id.nodes} Nodes"
+            plt.errorbar(x, y, yerr=err, label=label, capsize=3, marker=next(markers), linestyle='-')
+
+        plt.xlabel('Throughput (tx/s)', fontweight='bold')
+        plt.ylabel('Avg CPU Usage (%)', fontweight='bold')
+        plt.ylim(0, 100)
+        plt.grid(True)
+        plt.legend()
+
+        filename = os.path.join(self._make_plot_directory(), 'tps-cpu.png')
+        plt.savefig(filename, bbox_inches='tight')
+        print(f"Generated {filename}")
+
+    # [Added] Plot CPU Usage Over Time (Time-Series)
+    def plot_cpu_over_time(self, cores):
+        plot_data = []
+        transaction_size = self.parameters.transaction_size
+
+        for n in self.parameters.nodes:
+            for f in self.parameters.faults:
+                filename = self._file_format(transaction_size, f, n, '*')
+                measurements_list = self._load_measurement_data(filename)
+
+                if not measurements_list: continue
+                # Use the measurement with the highest load for the time-series
+                measurement = max(measurements_list, key=lambda x: x['parameters']['load'])
+
+                if 'system' not in measurement['data']: continue
+
+                for scraper_id, data_points in measurement['data']['system'].items():
+                    data_points.sort(key=lambda x: float(x['timestamp']['secs']))
+
+                    x_time = []
+                    y_cpu = []
+
+                    for i in range(1, len(data_points)):
+                        curr = data_points[i]
+                        prev = data_points[i-1]
+
+                        t1 = float(prev['timestamp']['secs'])
+                        t2 = float(curr['timestamp']['secs'])
+
+                        c1 = float(prev['cpu_accumulated_seconds'])
+                        c2 = float(curr['cpu_accumulated_seconds'])
+
+                        if t2 - t1 > 0:
+                            usage_percent = (c2 - c1) / (t2 - t1) / cores * 100
+                            x_time.append(t2)
+                            y_cpu.append(usage_percent)
+
+                    label = f"{n} nodes - Node {scraper_id}"
+                    plot_data.append((label, x_time, y_cpu))
+
+        self._plot_time_series(plot_data, "CPU Usage Over Time", "Time (s)", "CPU Usage (%)")
+
+    def _plot_time_series(self, data, title, xlabel, ylabel):
+        plt.figure(figsize=(10, 6))
+
+        for label, x, y in data:
+            plt.plot(x, y, label=label, marker='.', linestyle='-')
+
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        plt.ylim(0, 100)
+        plt.grid(True)
+        # Move legend outside if too many nodes
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+        filename = os.path.join(self._make_plot_directory(), 'cpu-over-time.png')
+        plt.savefig(filename, bbox_inches='tight')
+        print(f"Generated {filename}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -498,6 +658,13 @@ if __name__ == "__main__":
         '--precision', type=float, default=30.0,
         help='The granularity of the duration when aggregating results'
     )
+    # [Added] Arguments for CPU plotting
+    parser.add_argument(
+        '--cores', type=int, default=32,
+        help='Number of vCPUs per node for CPU usage normalization'
+    )
+    parser.add_argument('--plot-cpu', action='store_true', help='Plot CPU graphs')
+
     args = parser.parse_args()
 
     for r in args.transaction_size:
@@ -509,6 +676,11 @@ if __name__ == "__main__":
         plotter.plot_health(args.workload)
         plotter.plot_scalability(args.max_latencies, args.workload)
 
+        # [Added] Call CPU plotting functions if flag is set
+        if args.plot_cpu:
+            plotter.plot_tps_cpu(args.workload, args.cores)
+            plotter.plot_cpu_over_time(args.cores)
+
     if args.inspect is not None:
-        plotter.plot_inspect(args.inspect)
-        plotter.plot_duration(args.inspect, args.precision)
+        plotter.plot_inspect(args.inspect, args.workload)
+        plotter.plot_duration(args.inspect, args.precision, args.workload)

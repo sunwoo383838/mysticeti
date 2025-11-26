@@ -125,7 +125,7 @@ impl ProtocolCommands for MysticetiProtocol {
                 node_parameters_path.display(),
             ),
         ]
-        .join(" ");
+            .join(" ");
 
         [
             "source $HOME/.cargo/env",
@@ -133,7 +133,7 @@ impl ProtocolCommands for MysticetiProtocol {
             &upload_client_parameters,
             &genesis,
         ]
-        .join(" && ")
+            .join(" && ")
     }
 
     fn node_command<I>(
@@ -174,7 +174,7 @@ impl ProtocolCommands for MysticetiProtocol {
                         crypto_config_path.display()
                     ),
                 ]
-                .join(" ");
+                    .join(" ");
 
                 let command = ["source $HOME/.cargo/env", &run].join(" && ");
                 (instance, command)
@@ -222,6 +222,24 @@ impl ProtocolMetrics for MysticetiProtocol {
             .map(|x| format!("{x}{}", mysticeti_core::prometheus::METRICS_ROUTE));
 
         instances.into_iter().zip(metrics_paths).collect()
+    }
+
+    // [Modified] Override default implementation to scrape Node Exporter as well
+    fn nodes_metrics_command<I>(
+        &self,
+        instances: I,
+        parameters: &BenchmarkParameters,
+    ) -> Vec<(Instance, String)>
+    where
+        I: IntoIterator<Item = Instance>,
+    {
+        self.nodes_metrics_path(instances, parameters)
+            .into_iter()
+            .map(|(instance, path)| {
+                // Scrape both the node metrics and the node exporter metrics (port 9200)
+                (instance, format!("curl -s {path} && curl -s http://localhost:9200/metrics"))
+            })
+            .collect()
     }
 
     fn clients_metrics_path<I>(

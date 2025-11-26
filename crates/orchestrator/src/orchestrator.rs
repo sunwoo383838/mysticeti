@@ -216,8 +216,8 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
                 .collect::<Vec<_>>()[..],
             &self.protocol_commands.protocol_dependencies()[..],
         ]
-        .concat()
-        .join(" && ");
+            .concat()
+            .join(" && ");
 
         let active = self.instances.iter().filter(|x| x.is_active()).cloned();
         let context = CommandContext::default();
@@ -243,11 +243,11 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             .map_err(|e|
 
                 TestbedError::SshError(
-                crate::error::SshError::SessionError {
-                    address: "Local file system".parse().unwrap(),
-                    error: ssh2::Error::new(ssh2::ErrorCode::Session(-1), static_message)
-                }
-            ))?;
+                    crate::error::SshError::SessionError {
+                        address: "Local file system".parse().unwrap(),
+                        error: ssh2::Error::new(ssh2::ErrorCode::Session(-1), static_message)
+                    }
+                ))?;
 
         // SSH 환경에 맞게 내용을 이스케이프하고 원격 echo 명령을 구성합니다.
         // NOTE: Rust 문자열 리터럴에서 \n을 \n으로, '를 \'로 이스케이프해야 합니다.
@@ -349,7 +349,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             &format!("git reset --hard origin/{commit}"),            "source $HOME/.cargo/env",
             "RUSTFLAGS=-Ctarget-cpu=native cargo build --release",
         ]
-        .join(" && ");
+            .join(" && ");
 
         let active = self.instances.iter().filter(|x| x.is_active()).cloned();
 
@@ -550,9 +550,14 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         let mut killed_nodes: Vec<Instance> = Vec::new();
 
         // Regularly scrape the client metrics.
-        let metrics_commands = self
+        let mut metrics_commands = self
             .protocol_commands
             .clients_metrics_command(clients, parameters);
+
+        // [Modified] Also scrape the nodes (for CPU metrics via Node Exporter)
+        metrics_commands.extend(
+            self.protocol_commands.nodes_metrics_command(nodes.clone(), parameters)
+        );
 
         let mut aggregator = MeasurementsCollection::new(parameters.clone());
         let mut metrics_interval = time::interval(self.settings.scrape_interval);
@@ -636,8 +641,8 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             &format!("logs-{commit}").into(),
             &format!("logs-{parameters:?}").into(),
         ]
-        .iter()
-        .collect();
+            .iter()
+            .collect();
         fs::create_dir_all(&path).expect("Failed to create log directory");
 
         // NOTE: Our ssh library does not seem to be able to transfers files in parallel reliably.
