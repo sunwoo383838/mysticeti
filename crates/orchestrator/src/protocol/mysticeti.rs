@@ -254,8 +254,12 @@ impl ProtocolMetrics for MysticetiProtocol {
         self.nodes_metrics_path(instances, parameters)
             .into_iter()
             .map(|(instance, path)| {
-                // Scrape both the node metrics and the node exporter metrics (port 9200)
-                (instance, format!("curl -s {path} && curl -s http://localhost:9200/metrics"))
+                let port_and_route = path.rsplit_once(':').map(|(_, suffix)| suffix).unwrap_or(&path);
+                // Scrape both the node metrics (via localhost) and the node exporter metrics (port 9200)
+                (
+                    instance,
+                    format!("curl -s http://127.0.0.1:{port_and_route} && curl -s http://localhost:9200/metrics")
+                )
             })
             .collect()
     }
