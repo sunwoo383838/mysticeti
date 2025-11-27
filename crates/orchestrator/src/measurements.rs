@@ -41,6 +41,20 @@ pub struct Measurement {
     pub system_network_in_bytes: f64,
     #[serde(default)]
     pub system_network_out_bytes: f64,
+
+    #[serde(default)]
+    pub breakdown_queue_sum: f64,
+    #[serde(default)]
+    pub breakdown_verify_sum: f64,
+    #[serde(default)]
+    pub breakdown_pre_consensus_sum: f64,
+    #[serde(default)]
+    pub breakdown_cert_sum: f64,
+
+    #[serde(default)]
+    pub breakdown_commit_fpc_sum: f64,
+    #[serde(default)]
+    pub breakdown_commit_c_sum: f64,
 }
 
 impl Measurement {
@@ -58,8 +72,9 @@ impl Measurement {
             } else {
                 sample
                     .labels
-                    .values()
-                    .cloned()
+                    .iter()
+                    .filter(|(k, _)| *k != "path_type") // path_type은 키 생성에서 제외
+                    .map(|(_, v)| v.clone())
                     .collect::<Vec<_>>()
                     .join(",")
             };
@@ -126,6 +141,35 @@ impl Measurement {
                             if let prometheus_parse::Value::Counter(val) = sample.value {
                                 measurement.system_network_out_bytes += val;
                             }
+                        }
+                    }
+                },
+                x if x == "latency_breakdown_1_queue_sum" => {
+                    if let prometheus_parse::Value::Untyped(val) = sample.value {
+                        measurement.breakdown_queue_sum = val;
+                    }
+                },
+                x if x == "latency_breakdown_2_verify_sum" => {
+                    if let prometheus_parse::Value::Untyped(val) = sample.value {
+                        measurement.breakdown_verify_sum = val;
+                    }
+                },
+                x if x == "latency_breakdown_pre_consensus_sum" => {
+                    if let prometheus_parse::Value::Untyped(val) = sample.value {
+                        measurement.breakdown_pre_consensus_sum = val;
+                    }
+                },
+                x if x == "latency_breakdown_4_cert_sum" => {
+                    if let prometheus_parse::Value::Untyped(val) = sample.value {
+                        measurement.breakdown_cert_sum = val;
+                    }
+                },
+                x if x == "latency_breakdown_5_commit_sum" => {
+                    if let prometheus_parse::Value::Untyped(val) = sample.value {
+                        match sample.labels.get("path_type").map(|s| s) {
+                            Some("fpc") => measurement.breakdown_commit_fpc_sum = val,
+                            Some("c") => measurement.breakdown_commit_c_sum = val,
+                            _ => (), // path_type이 없거나 모르는 값이면 무시 (혹은 기본값에 더하기)
                         }
                     }
                 },
@@ -345,6 +389,12 @@ mod test {
             cpu_accumulated_seconds: 0.0,
             system_network_in_bytes: 0.0,
             system_network_out_bytes: 0.0,
+            breakdown_cert_sum: 0.0,
+            breakdown_pre_consensus_sum: 0.0,
+            breakdown_queue_sum: 0.0,
+            breakdown_verify_sum: 0.0,
+            breakdown_commit_c_sum: 0.0,
+            breakdown_commit_fpc_sum: 0.0,
         };
 
         assert_eq!(data.average_latency(), Duration::from_millis(20));
@@ -361,6 +411,12 @@ mod test {
             cpu_accumulated_seconds: 0.0,
             system_network_in_bytes: 0.0,
             system_network_out_bytes: 0.0,
+            breakdown_cert_sum: 0.0,
+            breakdown_commit_c_sum: 0.0,
+            breakdown_commit_fpc_sum: 0.0,
+            breakdown_pre_consensus_sum: 0.0,
+            breakdown_queue_sum: 0.0,
+            breakdown_verify_sum: 0.0
         };
 
         // squared_sum / count
