@@ -339,7 +339,7 @@ impl NodeExporter {
                 Self::RELEASE
             ),
             // (이전에 수정한 사용자 생성 로직 유지)
-            "id -u node_exporter >/dev/null 2>&1 || sudo useradd -rs /bin/false node_exporter",
+            "id -u node_exporter >/dev/null 2>&1 || sudo useradd -rs /bin/false node_exporter || true",
             "sudo chmod 777 -R /etc/systemd/system/",
             &format!(
                 "sudo echo \"{}\" > {}",
