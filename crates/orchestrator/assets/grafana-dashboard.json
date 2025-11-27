@@ -1007,6 +1007,126 @@
       ],
       "title": "Network receive (Mbps)",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-testbed"
+      },
+      "type": "timeseries",
+      "title": "CPU Usage (%)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "id": 20,
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 100,
+          "unit": "percent"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-testbed"
+          },
+          "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-testbed"
+      },
+      "type": "timeseries",
+      "title": "Network Traffic (MB/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "id": 21,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "mbytes"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-testbed"
+          },
+          "expr": "rate(node_network_receive_bytes_total{device!~\"lo\"}[1m]) / 1024 / 1024",
+          "legendFormat": "Inbound ({{instance}})",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Fixed-UID-testbed"
+          },
+          "expr": "rate(node_network_transmit_bytes_total{device!~\"lo\"}[1m]) / 1024 / 1024",
+          "legendFormat": "Outbound ({{instance}})",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Fixed-UID-testbed"
+      },
+      "type": "timeseries",
+      "title": "Latency Breakdown (Stacked)",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 48 },
+      "id": 22,
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "fillOpacity": 80
+          },
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Fixed-UID-testbed" },
+          "expr": "rate(latency_breakdown_1_queue_sum[1m]) / rate(latency_breakdown_1_queue_count[1m])",
+          "legendFormat": "Queue",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Fixed-UID-testbed" },
+          "expr": "rate(latency_breakdown_2_verify_sum[1m]) / rate(latency_breakdown_2_verify_count[1m])",
+          "legendFormat": "Verify",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Fixed-UID-testbed" },
+          "expr": "(rate(latency_breakdown_pre_consensus_sum[1m]) / rate(latency_breakdown_pre_consensus_count[1m])) - ((rate(latency_breakdown_1_queue_sum[1m]) / rate(latency_breakdown_1_queue_count[1m])) + (rate(latency_breakdown_2_verify_sum[1m]) / rate(latency_breakdown_2_verify_count[1m])))",
+          "legendFormat": "Batching",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Fixed-UID-testbed" },
+          "expr": "rate(latency_breakdown_4_cert_sum[1m]) / rate(latency_breakdown_4_cert_count[1m])",
+          "legendFormat": "Certification",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Fixed-UID-testbed" },
+          "expr": "(sum(rate(latency_breakdown_5_commit_sum[1m])) / sum(rate(latency_breakdown_5_commit_count[1m]))) - (rate(latency_breakdown_4_cert_sum[1m]) / rate(latency_breakdown_4_cert_count[1m]))",
+          "legendFormat": "Commit",
+          "refId": "E"
+        }
+      ]
     }
   ],
   "refresh": "5s",
@@ -1026,3 +1146,4 @@
   "version": 1,
   "weekStart": ""
 }
+

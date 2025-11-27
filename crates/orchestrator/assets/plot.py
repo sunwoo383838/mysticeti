@@ -473,30 +473,38 @@ class Plotter:
     def plot_fault_time_series(self, workload):
         transaction_size = self.parameters.transaction_size
 
+        # 색상 정의
+        colors = {
+            'queue': '#d3d3d3',      # 회색
+            'verify': '#ff7f0e',     # 주황
+            'batching': '#1f77b4',   # 파랑
+            'cert': '#2ca02c',       # 초록
+            'commit': '#d62728',     # 빨강
+        }
+
+        labels = {
+            'queue': 'Queue',
+            'verify': 'Verify',
+            'batching': 'Batching',
+            'cert': 'Certification',
+            'commit': 'Commitment'
+        }
+
         for n in self.parameters.nodes:
             for f in self.parameters.faults:
                 filename = self._file_format(transaction_size, f, n, '*')
                 measurements_list = self._load_measurement_data(filename)
                 if not measurements_list: continue
 
-                # 가장 높은 Load의 실험 데이터 하나를 선택 (장애 실험은 보통 고정 Load에서 수행)
                 measurement = max(measurements_list, key=lambda x: x['parameters']['load'])
-
-                # 장애 주입 시점 추출
                 fault_time = get_fault_delay(measurement)
-
-                # 데이터 집계 (시간대별 전체 TPS 및 평균 Latency 계산)
-                # 데이터 구조: measurement['data'][workload]['node_index'] = [Points...]
 
                 if workload[0] not in measurement['data']: continue
 
-                # 모든 노드의 데이터를 시간순으로 수집하여 글로벌 뷰 생성
-                # (각 노드의 스크랩 시간이 약간씩 다를 수 있으므로 정밀도를 기준으로 버킷팅)
-                precision = 1.0 # 1초 단위 집계
-                time_buckets = {} # time_sec -> {'count': sum, 'latency_sum': sum, 'samples': n}
+                precision = 1.0
+                time_buckets = {}
 
                 for node_id, points in measurement['data'][workload[0]].items():
-                    # 누적 카운터이므로 Delta를 구해야 함
                     points.sort(key=lambda x: float(x['timestamp']['secs']))
 
                     for i in range(1, len(points)):
@@ -509,69 +517,114 @@ class Plotter:
 
                         if dt <= 0: continue
 
-                        # 구간의 중간 지점을 타임스탬프로 사용
                         t_mid = (t_prev + t_curr) / 2
                         bucket_key = int(t_mid / precision) * precision
 
                         d_count = float(curr['count']) - float(prev['count'])
-                        d_sum = float(curr['sum']['secs']) - float(prev['sum']['secs'])
+                        if d_count <= 0: continue
 
-                        if d_count < 0: continue # 재시작 등의 경우 무시
+                        tps = d_count / dt
+
+                        # --- Latency Components Delta (평균) 계산 ---
+                        def get_delta_avg(key):
+                            val_curr = float(curr.get(key, 0))
+                            val_prev = float(prev.get(key, 0))
+                            return max(0, (val_curr - val_prev) / d_count)
+
+                        # 1. Raw Metrics 추출
+                        raw_queue = get_delta_avg('breakdown_queue_sum')
+                        raw_verify = get_delta_avg('breakdown_verify_sum')
+                        raw_pre_con = get_delta_avg('breakdown_pre_consensus_sum')
+                        raw_cert = get_delta_avg('breakdown_cert_sum')
+
+                        # Commit은 FPC와 C-Path 합산 (Raw 값: Block Creation ~ Commit)
+                        val_commit_curr = float(curr.get('breakdown_commit_fpc_sum', 0)) + float(curr.get('breakdown_commit_c_sum', 0))
+                        val_commit_prev = float(prev.get('breakdown_commit_fpc_sum', 0)) + float(prev.get('breakdown_commit_c_sum', 0))
+                        raw_commit = max(0, (val_commit_curr - val_commit_prev) / d_count)
+
+                        # 2. Layer별 순수 시간 계산 (Subtraction Logic)
+
+                        # Layer 3: Batching = PreConsensus - (Queue + Verify)
+                        layer_batching = max(0, raw_pre_con - (raw_queue + raw_verify))
+
+                        # Layer 5: Pure Commit = Raw Commit - Raw Cert
+                        # (Raw Commit은 Cert 시간을 포함하므로 빼줘야 함)
+                        layer_commit = max(0, raw_commit - raw_cert)
 
                         if bucket_key not in time_buckets:
-                            time_buckets[bucket_key] = {'tps': 0, 'lat_accum': 0, 'lat_weight': 0}
+                            time_buckets[bucket_key] = {
+                                'tps': 0,
+                                'weight': 0,
+                                'comps': {'queue': 0, 'verify': 0, 'batching': 0, 'cert': 0, 'commit': 0}
+                            }
 
-                        # TPS는 합산
-                        time_buckets[bucket_key]['tps'] += (d_count / dt)
+                        b = time_buckets[bucket_key]
+                        b['tps'] += tps
+                        b['weight'] += 1
 
-                        # Latency는 가중 평균을 위해 누적 (총 시간 / 총 개수)
-                        if d_count > 0:
-                            time_buckets[bucket_key]['lat_accum'] += (d_sum / d_count) # 여기선 단순 평균 합산 후 나눔
-                            time_buckets[bucket_key]['lat_weight'] += 1
+                        # 계산된 Layer 값 누적
+                        b['comps']['queue'] += raw_queue
+                        b['comps']['verify'] += raw_verify
+                        b['comps']['batching'] += layer_batching
+                        b['comps']['cert'] += raw_cert
+                        b['comps']['commit'] += layer_commit
 
-                # 그래프용 리스트 변환
                 sorted_times = sorted(time_buckets.keys())
                 if not sorted_times: continue
 
                 x_time = []
                 y_tps = []
-                y_lat = []
+
+                y_stacks = {
+                    'queue': [], 'verify': [], 'batching': [], 'cert': [], 'commit': []
+                }
 
                 for t in sorted_times:
                     b = time_buckets[t]
+                    w = b['weight'] if b['weight'] > 0 else 1
+
                     x_time.append(t)
                     y_tps.append(b['tps'])
-                    # 노드 간 Latency 평균
-                    avg_lat = b['lat_accum'] / b['lat_weight'] if b['lat_weight'] > 0 else 0
-                    y_lat.append(avg_lat)
+
+                    # 노드 간 평균 계산
+                    y_stacks['queue'].append(b['comps']['queue'] / w)
+                    y_stacks['verify'].append(b['comps']['verify'] / w)
+                    y_stacks['batching'].append(b['comps']['batching'] / w)
+                    y_stacks['cert'].append(b['comps']['cert'] / w)
+                    y_stacks['commit'].append(b['comps']['commit'] / w)
 
                 # --- Plotting ---
-                fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(8, 6))
+                fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 8))
 
                 # 상단: TPS
-                ax1.plot(x_time, y_tps, label=f'TPS ({n} Nodes)', color='#1f77b4', marker='.')
-                ax1.set_ylabel('TPS', fontweight='bold')
-                ax1.grid(True)
+                ax1.plot(x_time, y_tps, label=f'Throughput (TPS)', color='black', linewidth=1.5)
+                ax1.set_ylabel('Throughput (tx/s)', fontweight='bold')
+                ax1.grid(True, linestyle='--', alpha=0.5)
+                ax1.legend(loc='upper right')
+                ax1.set_title(f'Fault Impact Analysis ({n} Nodes, {f} Faults)', fontweight='bold')
 
-                # 하단: Latency
-                ax2.plot(x_time, y_lat, label=f'Latency ({n} Nodes)', color='#bcbd22', marker='d')
-                ax2.set_ylabel('Latency (s)', fontweight='bold')
+                # 하단: Latency Stacked Area
+                stack_keys = ['queue', 'verify', 'batching', 'cert', 'commit']
+                stack_data = [y_stacks[k] for k in stack_keys]
+                stack_colors = [colors[k] for k in stack_keys]
+                stack_labels = [labels[k] for k in stack_keys]
+
+                ax2.stackplot(x_time, *stack_data, labels=stack_labels, colors=stack_colors, alpha=0.85)
+
+                ax2.set_ylabel('Latency Breakdown (s)', fontweight='bold')
                 ax2.set_xlabel('Time (s)', fontweight='bold')
-                ax2.set_yscale('log') # 로그 스케일 (이미지 참조)
-                ax2.grid(True, which="both", ls="-", alpha=0.5)
+                ax2.grid(True, linestyle='--', alpha=0.5)
+                ax2.legend(loc='upper left', bbox_to_anchor=(1.0, 1.05), title="Latency Components")
 
-                # 빨간 점선 (장애 주입 시점)
                 if fault_time is not None:
                     ax1.axvline(x=fault_time, color='red', linestyle='--', linewidth=2, label='Fault Injection')
                     ax2.axvline(x=fault_time, color='red', linestyle='--', linewidth=2)
+                    ylim = ax1.get_ylim()
+                    ax1.text(fault_time, ylim[1]*0.9, ' Fault', color='red', fontweight='bold')
 
-                # 범례 및 타이틀
-                lines1, labels1 = ax1.get_legend_handles_labels()
-                ax1.legend(lines1, labels1, loc='best')
+                plt.tight_layout()
 
-                plt.suptitle(f'Fault Scenario Impact ({n} Nodes, {f} Faults)', fontweight='bold')
-
-                plot_name = f'fault-series-{n}-{transaction_size}.png'
+                plot_name = f'fault-breakdown-series-{n}-{transaction_size}.png'
                 filename = os.path.join(self._make_plot_directory(), plot_name)
                 plt.savefig(filename, bbox_inches='tight')
                 print(f"Generated {filename}")
