@@ -15,73 +15,114 @@ from itertools import cycle
 # A simple python script to plot measurements results. This script requires
 # the following dependencies: `pip install matplotlib`.
 
-def ramp_up(scraper, ramp_up_threshold=120):
-    ramp_up_duration, ramp_up_count = 0, 0
-    ramp_up_sum, ramp_up_square_sum = 0, 0
-    for data in scraper:
-        duration = float(data['timestamp']['secs'])
-        if duration > ramp_up_threshold:
-            ramp_up_duration = duration
-            ramp_up_count = float(data['count'])
-            ramp_up_sum = float(data['sum']['secs'])
-            ramp_up_square_sum = float(data['squared_sum']['secs'])
+# Constants for data filtering
+WARM_UP_THRESHOLD = 40
+COOL_DOWN_THRESHOLD = 3
+
+def get_valid_data_window(data_points):
+    """
+    Returns the start and end data points defining the valid measurement window.
+    Excludes warm-up (first 40s) and cool-down (last 3s).
+    """
+    if not data_points:
+        return None, None
+
+    # 1. Find max duration to determine cutoff for cool-down
+    total_duration = float(data_points[-1]['timestamp']['secs'])
+    cutoff_time = total_duration - COOL_DOWN_THRESHOLD
+
+    # 2. Find Start (Warm-up)
+    start_point = None
+    start_idx = -1
+    for i, p in enumerate(data_points):
+        if float(p['timestamp']['secs']) > WARM_UP_THRESHOLD:
+            start_point = p
+            start_idx = i
             break
-    return ramp_up_duration, ramp_up_count, ramp_up_sum, ramp_up_square_sum
+
+    if start_point is None:
+        return None, None
+
+    # 3. Find End (Cool-down)
+    end_point = None
+    # Search backwards from the end to find the last point within cutoff
+    for i in range(len(data_points) - 1, start_idx, -1):
+        p = data_points[i]
+        if float(p['timestamp']['secs']) <= cutoff_time:
+            end_point = p
+            break
+
+    if end_point is None:
+        return None, None
+
+    # Check if window is valid (start comes before end)
+    if float(start_point['timestamp']['secs']) >= float(end_point['timestamp']['secs']):
+        return None, None
+
+    return start_point, end_point
 
 def aggregate_tps(measurement, workload):
     if workload not in measurement['data']:
         return 0
 
-    max_duration = 0
+    tps_values = []
     for data in measurement['data'][workload].values():
-        ramp_up_duration, _, _, _ = ramp_up(data)
-        duration = float(data[-1]['timestamp']['secs']) - ramp_up_duration
-        max_duration = max(duration, max_duration)
+        start, end = get_valid_data_window(data)
+        if start and end:
+            duration = float(end['timestamp']['secs']) - float(start['timestamp']['secs'])
+            count = float(end['count']) - float(start['count'])
+            if duration > 0:
+                tps_values.append(count / duration)
+            else:
+                tps_values.append(0)
+        else:
+            tps_values.append(0)
 
-    tps = []
-    for data in measurement['data'][workload].values():
-        _, ramp_up_count, _, _ = ramp_up(data)
-        count = float(data[-1]['count']) - ramp_up_count
-        tps += [(count / max_duration) if max_duration != 0 else 0]
-    return max(tps)
+    return max(tps_values) if tps_values else 0
 
 
 def aggregate_average_latency(measurement, workload):
     if workload not in measurement['data']:
         return 0
 
-    latency = []
+    latencies = []
     for data in measurement['data'][workload].values():
-        _, ramp_up_count, ramp_up_sum, _ = ramp_up(data)
-        last = data[-1]
-        count = float(last['count']) - ramp_up_count
-        total = float(last['sum']['secs']) - ramp_up_sum
-        latency += [total / count if count != 0 else 0]
-    return sum(latency) / len(latency) if latency else 0
+        start, end = get_valid_data_window(data)
+        if start and end:
+            count = float(end['count']) - float(start['count'])
+            total = float(end['sum']['secs']) - float(start['sum']['secs'])
+            if count > 0:
+                latencies.append(total / count)
+            else:
+                latencies.append(0)
+
+    return sum(latencies) / len(latencies) if latencies else 0
 
 
 def aggregate_stdev_latency(measurement, workload):
     if workload not in measurement['data']:
         return 0
 
-    stdev = []
+    stdevs = []
     for data in measurement['data'][workload].values():
-        _, ramp_up_count, ramp_up_sum, ramp_up_square_sum = ramp_up(data)
-        last = data[-1]
-        count = float(last['count']) - ramp_up_count
-        if count == 0:
-            stdev += [0]
-        else:
-            latency_sum = float(last['sum']['secs']) - ramp_up_sum
-            latency_square_sum = float(last['squared_sum']['secs']) - ramp_up_square_sum
+        start, end = get_valid_data_window(data)
+        if start and end:
+            count = float(end['count']) - float(start['count'])
+            if count > 0:
+                latency_sum = float(end['sum']['secs']) - float(start['sum']['secs'])
+                latency_square_sum = float(end['squared_sum']) - float(start['squared_sum'])
+                first_term = latency_square_sum / count
+                second_term = (latency_sum / count)**2
 
-            first_term = latency_square_sum / count
-            second_term = (latency_sum / count)**2
-            if round(first_term - second_term) != 0:
-                stdev += [math.sqrt(first_term - second_term)]
+                variance = first_term - second_term
+                if variance > 0:
+                    stdevs.append(math.sqrt(variance))
+                else:
+                    stdevs.append(0)
             else:
-                stdev += [0]
-    return max(stdev)
+                stdevs.append(0)
+
+    return max(stdevs) if stdevs else 0
 
 def get_fault_delay(measurement):
     """
@@ -104,26 +145,42 @@ def get_fault_delay(measurement):
         print(f"Failed to extract fault delay: {e}")
     return None
 
-def aggregate_p_latency(measurement, workload, p=50, i=-1):
+def aggregate_p_latency(measurement, workload, p=50):
     if workload not in measurement['data']:
         return 0
 
-    latency = []
+    latencies = []
     for data in measurement['data'][workload].values():
-        last = data[i]
-        count = float(last['count'])
-        buckets = [(float(l), c) for l, c in last['buckets'].items()]
-        buckets.sort(key=lambda x: x[0])
+        start, end = get_valid_data_window(data)
+        if not (start and end):
+            continue
 
-        for l, c in buckets:
+        # Calculate count in the window
+        count = float(end['count']) - float(start['count'])
+        if count <= 0:
+            continue
+
+        # Reconstruct buckets for the window
+        buckets_start = start['buckets']
+        buckets_end = end['buckets']
+
+        window_buckets = []
+        # Iterate over all keys in end buckets
+        for le, c_end in buckets_end.items():
+            c_start = buckets_start.get(le, 0)
+            window_buckets.append((float(le), c_end - c_start))
+
+        window_buckets.sort(key=lambda x: x[0])
+
+        for l, c in window_buckets:
             if c >= count * p / 100:
-                latency += [l]
+                latencies.append(l)
                 break
 
-    return sum(latency) / len(latency) if latency else 0
+    return sum(latencies) / len(latencies) if latencies else 0
 
-# [Added] Function to calculate average CPU usage over a steady state period
-def aggregate_cpu_usage(measurement, warm_up_sec=60, cores=32):
+# [Modified] Function to calculate average CPU usage over a steady state period
+def aggregate_cpu_usage(measurement, cores=32):
     if 'system' not in measurement['data']:
         return 0, 0
 
@@ -132,27 +189,15 @@ def aggregate_cpu_usage(measurement, warm_up_sec=60, cores=32):
     for scraper_id, data_points in measurement['data']['system'].items():
         data_points.sort(key=lambda x: float(x['timestamp']['secs']))
 
-        if not data_points:
+        # Use standardized window function
+        start, end = get_valid_data_window(data_points)
+
+        if not (start and end):
             continue
-
-        start_time = float(data_points[0]['timestamp']['secs'])
-        valid_points = []
-
-        # Filter out warm-up period
-        for p in data_points:
-            t = float(p['timestamp']['secs'])
-            if t >= start_time + warm_up_sec:
-                valid_points.append(p)
-
-        if len(valid_points) < 2:
-            continue
-
-        first = valid_points[0]
-        last = valid_points[-1]
 
         # Calculate usage based on accumulated CPU seconds and elapsed time
-        delta_cpu = float(last['cpu_accumulated_seconds']) - float(first['cpu_accumulated_seconds'])
-        delta_time = float(last['timestamp']['secs']) - float(first['timestamp']['secs'])
+        delta_cpu = float(end['cpu_accumulated_seconds']) - float(start['cpu_accumulated_seconds'])
+        delta_time = float(end['timestamp']['secs']) - float(start['timestamp']['secs'])
 
         if delta_time > 0:
             # Normalize by number of cores to get percentage (0-100%)
@@ -184,22 +229,22 @@ def aggregate_breakdown_components(measurement, workload):
         'commit_fpc': 0.0, 'commit_c': 0.0, 'count': 0.0
     }
 
-    # 모든 노드(scraper)의 데이터를 순회하며 마지막(steady-state) 값 합산
-    # (더 정교하게 하려면 ramp_up 로직을 적용하여 delta를 구해야 함)
+    # Use valid data window
     valid_nodes = 0
     for data in measurement['data'][workload].values():
-        if not data: continue
-        last = data[-1]
-        count = float(last['count'])
-        if count == 0: continue
+        start, end = get_valid_data_window(data)
+        if not (start and end): continue
+
+        count = float(end['count']) - float(start['count'])
+        if count <= 0: continue
 
         sums['count'] += count
-        sums['queue'] += float(last.get('breakdown_queue_sum', 0))
-        sums['verify'] += float(last.get('breakdown_verify_sum', 0))
-        sums['pre_con'] += float(last.get('breakdown_pre_consensus_sum', 0))
-        sums['cert'] += float(last.get('breakdown_cert_sum', 0))
-        sums['commit_fpc'] += float(last.get('breakdown_commit_fpc_sum', 0))
-        sums['commit_c'] += float(last.get('breakdown_commit_c_sum', 0))
+        sums['queue'] += float(end.get('breakdown_queue_sum', 0)) - float(start.get('breakdown_queue_sum', 0))
+        sums['verify'] += float(end.get('breakdown_verify_sum', 0)) - float(start.get('breakdown_verify_sum', 0))
+        sums['pre_con'] += float(end.get('breakdown_pre_consensus_sum', 0)) - float(start.get('breakdown_pre_consensus_sum', 0))
+        sums['cert'] += float(end.get('breakdown_cert_sum', 0)) - float(start.get('breakdown_cert_sum', 0))
+        sums['commit_fpc'] += float(end.get('breakdown_commit_fpc_sum', 0)) - float(start.get('breakdown_commit_fpc_sum', 0))
+        sums['commit_c'] += float(end.get('breakdown_commit_c_sum', 0)) - float(start.get('breakdown_commit_c_sum', 0))
         valid_nodes += 1
 
     if sums['count'] == 0:
@@ -214,7 +259,7 @@ def aggregate_breakdown_components(measurement, workload):
 
     return avgs
 
-def aggregate_network_bandwidth(measurement, warm_up_sec=60):
+def aggregate_network_bandwidth(measurement):
     if 'system' not in measurement['data']:
         return 0, 0
 
@@ -225,35 +270,22 @@ def aggregate_network_bandwidth(measurement, warm_up_sec=60):
     for scraper_id, data_points in measurement['data']['system'].items():
         data_points.sort(key=lambda x: float(x['timestamp']['secs']))
 
-        if not data_points:
+        # Use standardized window function
+        start, end = get_valid_data_window(data_points)
+
+        if not (start and end):
             continue
 
-        start_time = float(data_points[0]['timestamp']['secs'])
-        valid_points = []
-
-        # Warm-up 기간 제외 (CPU 로직과 동일)
-        for p in data_points:
-            t = float(p['timestamp']['secs'])
-            if t >= start_time + warm_up_sec:
-                valid_points.append(p)
-
-        if len(valid_points) < 2:
-            continue
-
-        first = valid_points[0]
-        last = valid_points[-1]
-
-        delta_time = float(last['timestamp']['secs']) - float(first['timestamp']['secs'])
+        delta_time = float(end['timestamp']['secs']) - float(start['timestamp']['secs'])
 
         if delta_time > 0:
             # 수신 대역폭 계산 (Bytes -> MB 변환)
-            # measurement.rs에서 추가한 system_network_in_bytes 필드를 사용
-            delta_in = float(last.get('system_network_in_bytes', 0)) - float(first.get('system_network_in_bytes', 0))
+            delta_in = float(end.get('system_network_in_bytes', 0)) - float(start.get('system_network_in_bytes', 0))
             in_rate_mbps = (delta_in / delta_time) / (1024 * 1024)
             in_rates.append(in_rate_mbps)
 
             # 송신 대역폭 계산 (Bytes -> MB 변환)
-            delta_out = float(last.get('system_network_out_bytes', 0)) - float(first.get('system_network_out_bytes', 0))
+            delta_out = float(end.get('system_network_out_bytes', 0)) - float(start.get('system_network_out_bytes', 0))
             out_rate_mbps = (delta_out / delta_time) / (1024 * 1024)
             out_rates.append(out_rate_mbps)
 
@@ -306,15 +338,52 @@ class PlotParameters:
 
 class MeasurementId:
     def __init__(self, measurement, workload, max_latency=None):
-        self.transaction_size = measurement['parameters']['benchmark_type']['transaction_size']
-        self.nodes = measurement['parameters']['nodes']
-        if 'Permanent' in measurement['parameters']['faults']:
-            self.faults = measurement['parameters']['faults']['Permanent']['faults']
+        # [수정 1] transaction_size 경로 변경 (benchmark_type -> client_parameters)
+        if 'client_parameters' in measurement['parameters']:
+            self.transaction_size = measurement['parameters']['client_parameters']['transaction_size']
         else:
+            # 구버전 호환성 유지
+            self.transaction_size = measurement['parameters']['benchmark_type']['transaction_size']
+
+        self.nodes = measurement['parameters']['nodes']
+
+        # [수정 2] faults 경로 및 구조 변경
+        # JSON 구조: parameters -> settings -> faults -> Permanent -> faults
+        self.faults = 0
+        try:
+            if 'settings' in measurement['parameters'] and 'faults' in measurement['parameters']['settings']:
+                faults_conf = measurement['parameters']['settings']['faults']
+                if 'Permanent' in faults_conf:
+                    self.faults = faults_conf['Permanent'].get('faults', 0)
+            elif 'faults' in measurement['parameters']:
+                if 'Permanent' in measurement['parameters']['faults']:
+                    self.faults = measurement['parameters']['faults']['Permanent']['faults']
+        except (KeyError, TypeError):
             self.faults = 0
-        self.duration = measurement['parameters']['duration']
-        self.machine_specs = measurement['machine_specs']
-        self.commit = measurement['commit']
+
+        # [수정 3] duration 경로 변경
+        if 'settings' in measurement['parameters'] and 'benchmark_duration' in measurement['parameters']['settings']:
+            self.duration = measurement['parameters']['settings']['benchmark_duration']
+        elif 'duration' in measurement['parameters']:
+            self.duration = measurement['parameters']['duration']
+        else:
+            self.duration = 0
+
+        # [수정 4] machine_specs 경로 변경
+        if 'settings' in measurement['parameters'] and 'specs' in measurement['parameters']['settings']:
+            self.machine_specs = measurement['parameters']['settings']['specs']
+        elif 'machine_specs' in measurement:
+            self.machine_specs = measurement['machine_specs']
+        else:
+            self.machine_specs = "unknown"
+
+        # [수정 5] commit 정보 경로 변경
+        if 'settings' in measurement['parameters'] and 'repository' in measurement['parameters']['settings']:
+            self.commit = measurement['parameters']['settings']['repository'].get('commit', 'unknown')
+        elif 'commit' in measurement:
+            self.commit = measurement['commit']
+        else:
+            self.commit = "unknown"
 
         self.workload = workload
         self.max_latency = max_latency
@@ -440,7 +509,7 @@ class Plotter:
         return measurements
 
     def _file_format(self, transaction_size, faults, nodes, load):
-        return f'measurements-{transaction_size}-{faults}-{nodes}-{load}.json'
+        return f'measurements-fpc-{transaction_size}-{faults}-{nodes}-{load}.json'
 
     def plot_latency_throughput(self, workload):
         plot_lines_data = []
@@ -843,7 +912,18 @@ class Plotter:
             except json.JSONDecodeError as e:
                 raise PlotError(f'Failed to load file {file}: {e}')
 
-        total_duration = float(measurement['parameters']['duration']['secs'])
+        # [수정됨] JSON 구조 변경에 따른 Duration 파싱 로직 개선
+        if 'settings' in measurement['parameters'] and 'benchmark_duration' in measurement['parameters']['settings']:
+            # 최신 포맷: settings 내부에 benchmark_duration (숫자)
+            total_duration = float(measurement['parameters']['settings']['benchmark_duration'])
+        else:
+            # 구버전 포맷 호환성 유지
+            dur = measurement['parameters'].get('duration', 0)
+            if isinstance(dur, dict) and 'secs' in dur:
+                total_duration = float(dur['secs'])
+            else:
+                total_duration = float(dur)
+
         length = int(total_duration / precision)
 
         scrapers_tps_data, scrapers_lat_data = [], []
@@ -901,18 +981,18 @@ class Plotter:
         for n in self.parameters.nodes:
             for f in self.parameters.faults:
                 filename = self._file_format(transaction_size, f, n, '*')
-                measurements = self._load_measurement_data(filename)
+                measurements_list = self._load_measurement_data(filename)
 
                 x_values = []
                 y_values = []
                 y_err = []
 
-                measurements.sort(key=lambda x: x['parameters']['load'])
+                measurements_list.sort(key=lambda x: x['parameters']['load'])
 
-                for m in measurements:
+                for m in measurements_list:
                     # Use the first workload specified to calculate TPS for the X-axis
                     real_tps = aggregate_tps(m, workload[0])
-                    avg_cpu, stdev_cpu = aggregate_cpu_usage(m, warm_up_sec=60, cores=cores)
+                    avg_cpu, stdev_cpu = aggregate_cpu_usage(m, cores=cores)
 
                     if real_tps > 0:
                         x_values.append(real_tps)
@@ -920,7 +1000,7 @@ class Plotter:
                         y_err.append(stdev_cpu)
 
                 if x_values:
-                    id = MeasurementId(measurements[0], workload[0])
+                    id = MeasurementId(measurements_list[0], workload[0])
                     plot_data.append((id, x_values, y_values, y_err))
 
         self._plot_cpu(plot_data)

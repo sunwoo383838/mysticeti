@@ -87,9 +87,17 @@ impl ProtocolCommands for MysticetiProtocol {
     }
 
     fn db_directories(&self) -> Vec<std::path::PathBuf> {
-        vec![self.working_dir.join("storage-*")]
-    }
+        vec![
+            // 1. 기존 WAL 및 블록 스토리지 정리
+            self.working_dir.join("storage-*"),
 
+            // 🌟 2. [추가] NullifierDB 경로 정리
+            // nullifier.rs에서 dirs_next::data_dir()를 사용하므로,
+            // Linux 환경(AWS/Vultr 등)에서는 통상적으로 ~/.local/share/mysticeti-vote 에 저장됩니다.
+            // SSH 명령은 홈 디렉토리에서 실행되므로 상대 경로로 지정합니다.
+            PathBuf::from(".local/share/mysticeti-vote"),
+        ]
+    }
     async fn genesis_command<'a, I>(&self, instances: I, parameters: &BenchmarkParameters) -> String
     where
         I: Iterator<Item = &'a Instance>,

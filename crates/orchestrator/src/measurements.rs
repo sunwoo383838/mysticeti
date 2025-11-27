@@ -21,6 +21,10 @@ type BucketId = String;
 /// The identifier of a measurement type.
 type Label = String;
 
+// Constants for steady state window calculation
+const WARM_UP: Duration = Duration::from_secs(40);
+const COOLDOWN: Duration = Duration::from_secs(3);
+
 /// A snapshot measurement at a given time.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Measurement {
@@ -169,7 +173,7 @@ impl Measurement {
                         match sample.labels.get("path_type").map(|s| s) {
                             Some("fpc") => measurement.breakdown_commit_fpc_sum = val,
                             Some("c") => measurement.breakdown_commit_c_sum = val,
-                            _ => (), // path_type이 없거나 모르는 값이면 무시 (혹은 기본값에 더하기)
+                            _ => (),
                         }
                     }
                 },
@@ -304,28 +308,100 @@ impl MeasurementsCollection {
             .unwrap_or_default()
     }
 
-    /// Aggregate the tps of multiple data points.
-    pub fn aggregate_tps(&self, label: &Label) -> u64 {
-        self.max_result(label, |x| x.count)
-            .checked_div(self.max_result(label, |x| x.timestamp.as_secs_f64() as usize))
-            .unwrap_or_default() as u64
+    /// Helper to find the steady state window [warm_up, total - cooldown]
+    fn get_steady_state_window<'a>(
+        measurements: &'a [Measurement],
+    ) -> Option<(&'a Measurement, &'a Measurement)> {
+        if measurements.is_empty() {
+            return None;
+        }
+
+        let total_duration = measurements.last().unwrap().timestamp;
+        let cutoff = total_duration.saturating_sub(COOLDOWN);
+
+        let start = measurements.iter().find(|m| m.timestamp > WARM_UP);
+        let end = measurements.iter().rev().find(|m| m.timestamp <= cutoff);
+
+        match (start, end) {
+            (Some(s), Some(e)) if s.timestamp < e.timestamp => Some((s, e)),
+            _ => None,
+        }
     }
 
-    /// Aggregate the average latency of multiple data points by taking the average.
-    pub fn aggregate_average_latency(&self, label: &Label) -> Duration {
-        let all_measurements = self.all_measurements(label);
-        let last_data_points: Vec<_> = all_measurements.iter().filter_map(|x| x.last()).collect();
-        last_data_points
+    /// Aggregate the tps of multiple data points.
+    /// Calculates max TPS across all nodes in the steady state window.
+    pub fn aggregate_tps(&self, label: &Label) -> u64 {
+        self.all_measurements(label)
             .iter()
-            .map(|x| x.average_latency())
-            .sum::<Duration>()
-            .checked_div(last_data_points.len() as u32)
+            .map(|scraper_data| {
+                if let Some((start, end)) = Self::get_steady_state_window(scraper_data) {
+                    let duration = end.timestamp.as_secs_f64() - start.timestamp.as_secs_f64();
+                    let count = end.count.saturating_sub(start.count) as f64;
+                    if duration > 0.0 {
+                        (count / duration) as u64
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            })
+            .max()
             .unwrap_or_default()
     }
 
-    /// Aggregate the stdev latency of multiple data points by taking the max.
+    /// Aggregate the average latency of multiple data points by taking the average in the steady state window.
+    pub fn aggregate_average_latency(&self, label: &Label) -> Duration {
+        let all_measurements = self.all_measurements(label);
+        let mut latencies = Vec::new();
+
+        for scraper_data in all_measurements {
+            if let Some((start, end)) = Self::get_steady_state_window(&scraper_data) {
+                let count = (end.count.saturating_sub(start.count)) as u32;
+                if count > 0 {
+                    let total_time = end.sum.saturating_sub(start.sum);
+                    latencies.push(total_time / count);
+                }
+            }
+        }
+
+        if latencies.is_empty() {
+            return Duration::default();
+        }
+
+        let sum: Duration = latencies.iter().sum();
+        sum / latencies.len() as u32
+    }
+
+    /// Aggregate the stdev latency of multiple data points by taking the max in the steady state window.
     pub fn max_stdev_latency(&self, label: &Label) -> Duration {
-        self.max_result(label, |x| x.stdev_latency())
+        self.all_measurements(label)
+            .iter()
+            .map(|scraper_data| {
+                if let Some((start, end)) = Self::get_steady_state_window(scraper_data) {
+                    let count = (end.count.saturating_sub(start.count)) as f64;
+                    if count > 0.0 {
+                        let latency_sum = (end.sum.saturating_sub(start.sum)).as_secs_f64();
+                        let latency_sq_sum = end.squared_sum - start.squared_sum;
+
+                        let first = latency_sq_sum / count;
+                        let second = (latency_sum / count).powi(2);
+                        let variance = first - second;
+
+                        if variance > 0.0 {
+                            Duration::from_secs_f64(variance.sqrt())
+                        } else {
+                            Duration::default()
+                        }
+                    } else {
+                        Duration::default()
+                    }
+                } else {
+                    Duration::default()
+                }
+            })
+            .max()
+            .unwrap_or_default()
     }
 
     /// Save the collection of measurements as a json file.
