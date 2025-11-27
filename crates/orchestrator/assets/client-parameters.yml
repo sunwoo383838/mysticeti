@@ -1,6 +1,5 @@
 initial_delay:
   secs: 30
   nanos: 0
-load: 100
 transaction_size: 512
 

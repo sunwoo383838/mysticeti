@@ -335,7 +335,7 @@ impl NodeExporter {
                 "sudo mv node_exporter-{}.linux-amd64/node_exporter /usr/local/bin/",
                 Self::RELEASE
             ),
-            "sudo useradd -rs /bin/false node_exporter || true",
+            "id -u node_exporter >/dev/null 2>&1 || sudo useradd -rs /bin/false node_exporter",
             "sudo chmod 777 -R /etc/systemd/system/",
             &format!(
                 "sudo echo \"{}\" > {}",
