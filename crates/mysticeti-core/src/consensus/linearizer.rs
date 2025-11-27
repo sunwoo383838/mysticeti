@@ -54,16 +54,14 @@ impl Linearizer {
         let leader_block_ref = *leader_block.reference();
         let mut buffer = vec![leader_block];
         assert!(self.committed.insert(leader_block_ref));
+
         while let Some(x) = buffer.pop() {
             to_commit.push(x.clone());
             for reference in x.includes() {
-                // The block manager may have cleaned up blocks passed the latest committed rounds.
                 let block = block_store
                     .get_block(*reference)
                     .expect("We should have the whole sub-dag by now");
 
-                // Skip the block if we already committed it (either as part of this sub-dag or
-                // a previous one).
                 if self.committed.insert(*reference) {
                     buffer.push(block);
                 }
@@ -71,6 +69,7 @@ impl Linearizer {
         }
         CommittedSubDag::new(leader_block_ref, to_commit)
     }
+
 
     pub fn handle_commit(
         &mut self,
@@ -81,9 +80,6 @@ impl Linearizer {
         for leader_block in committed_leaders {
             // Collect the sub-dag generated using each of these leaders as anchor.
             let mut sub_dag = self.collect_sub_dag(block_store, leader_block);
-
-            // [Optional] sort the sub-dag using a deterministic algorithm.
-            sub_dag.sort();
             committed.push(sub_dag);
         }
         committed

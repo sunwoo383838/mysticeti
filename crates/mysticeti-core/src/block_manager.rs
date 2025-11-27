@@ -18,7 +18,7 @@ use crate::{
 /// returning newly connected blocks
 pub struct BlockManager {
     /// Keeps all pending blocks.
-    blocks_pending: HashMap<BlockReference, Data<StatementBlock>>,
+    blocks_pending: HashMap<BlockReference, (Data<StatementBlock>, bool)>,
     /// Keeps all the blocks (`HashSet<BlockReference>`) waiting for `BlockReference` to be processed.
     block_references_waiting: HashMap<BlockReference, HashSet<BlockReference>>,
     /// Keeps all blocks that need to be synced in order to unblock the processing of other pending
@@ -39,12 +39,14 @@ impl BlockManager {
 
     pub fn add_blocks(
         &mut self,
-        blocks: Vec<Data<StatementBlock>>,
+        blocks: Vec<(Data<StatementBlock>, bool)>, // 입력: (블록, 플래그) 튜플의 벡터
         block_writer: &mut impl BlockWriter,
-    ) -> Vec<(WalPosition, Data<StatementBlock>)> {
-        let mut blocks: VecDeque<Data<StatementBlock>> = blocks.into();
-        let mut newly_blocks_processed: Vec<(WalPosition, Data<StatementBlock>)> = vec![];
-        while let Some(block) = blocks.pop_front() {
+    ) -> Vec<(WalPosition, Data<StatementBlock>, bool)> { // 반환: (저장위치, 블록, 플래그) 튜플의 벡터
+
+        let mut blocks: VecDeque<(Data<StatementBlock>, bool)> = blocks.into();
+        let mut newly_blocks_processed: Vec<(WalPosition, Data<StatementBlock>, bool)> = vec![];
+
+        while let Some((block, check_individual)) = blocks.pop_front() {
             // Update the highest known round number.
 
             // check whether we have already processed this block and skip it if so.
@@ -73,13 +75,16 @@ impl BlockManager {
             self.missing[block_reference.authority as usize].remove(block_reference);
 
             if !processed {
-                self.blocks_pending.insert(*block_reference, block);
+                // 🌟 [수정] 대기열에 넣을 때 플래그도 함께 저장
+                self.blocks_pending.insert(*block_reference, (block, check_individual));
             } else {
                 let block_reference = *block_reference;
 
                 // Block can be processed. So need to update indexes etc
                 let position = block_writer.insert_block(block.clone());
-                newly_blocks_processed.push((position, block.clone()));
+
+                // 🌟 [수정] 처리 결과에 플래그 포함하여 저장
+                newly_blocks_processed.push((position, block.clone(), check_individual));
 
                 // Now unlock any pending blocks, and process them if ready.
                 if let Some(waiting_references) =
@@ -87,17 +92,27 @@ impl BlockManager {
                 {
                     // For each reference see if its unblocked.
                     for waiting_block_reference in waiting_references {
-                        let block_pointer = self.blocks_pending.get(&waiting_block_reference).expect("Safe since we ensure the block waiting reference has a valid primary key.");
+                        // 🌟 [수정] 대기열에서 블록을 조회할 때 튜플로 가져옴
+                        // (여기서는 참조만 필요하므로 get 사용, 타입 불일치 주의)
+                        // 실제로는 아래에서 remove로 꺼내기 때문에 get은 생략 가능하거나 로직에 따라 조정
 
-                        if block_pointer
-                            .includes()
-                            .iter()
-                            .all(|item_ref| !self.block_references_waiting.contains_key(item_ref))
-                        {
+                        // 기존 코드의 로직을 그대로 따르되 타입만 맞춤:
+                        // includes 검사를 위해 pending 맵을 조회해야 하는데,
+                        // self.blocks_pending.get(...)의 반환 타입이 &(Data, bool)이 됨.
+
+                        let is_ready = if let Some((pending_block, _)) = self.blocks_pending.get(&waiting_block_reference) {
+                            pending_block.includes().iter().all(|item_ref| !self.block_references_waiting.contains_key(item_ref))
+                        } else {
+                            false // 이미 처리되었거나 없으면 무시
+                        };
+
+                        if is_ready {
                             // No dependencies are left unprocessed, so remove from unprocessed list, and add to the
                             // blocks we are processing now.
-                            let block = self.blocks_pending.remove(&waiting_block_reference).expect("Safe since we ensure the block waiting reference has a valid primary key.");
-                            blocks.push_front(block);
+
+                            // 🌟 [수정] 대기열에서 꺼낼 때 (블록, 플래그)를 모두 꺼내서 처리 큐에 넣음
+                            let (block, flag) = self.blocks_pending.remove(&waiting_block_reference).expect("Safe since we ensure the block waiting reference has a valid primary key.");
+                            blocks.push_front((block, flag));
                         }
                     }
                 }
@@ -131,9 +146,9 @@ mod tests {
             let mut bm = BlockManager::new(block_writer.block_store(), &dag.committee());
             let mut processed_blocks = HashSet::new();
             for block in iter {
-                let processed = bm.add_blocks(vec![block.clone()], &mut block_writer);
+                let processed = bm.add_blocks(vec![(block.clone(), true)], &mut block_writer);
                 print!("Adding {:?}:", block.reference());
-                for (_, p) in processed {
+                for (_, p, _) in processed {
                     print!("{:?},", p.reference());
                     if !processed_blocks.insert(p.reference().clone()) {
                         panic!("Block {:?} processed twice", p.reference());

@@ -151,6 +151,58 @@ def aggregate_cpu_usage(measurement, warm_up_sec=60, cores=32):
 
     return global_avg, stdev
 
+def aggregate_network_bandwidth(measurement, warm_up_sec=60):
+    if 'system' not in measurement['data']:
+        return 0, 0
+
+    in_rates = []
+    out_rates = []
+
+    # 각 노드(scraper_id)별로 데이터를 순회
+    for scraper_id, data_points in measurement['data']['system'].items():
+        data_points.sort(key=lambda x: float(x['timestamp']['secs']))
+
+        if not data_points:
+            continue
+
+        start_time = float(data_points[0]['timestamp']['secs'])
+        valid_points = []
+
+        # Warm-up 기간 제외 (CPU 로직과 동일)
+        for p in data_points:
+            t = float(p['timestamp']['secs'])
+            if t >= start_time + warm_up_sec:
+                valid_points.append(p)
+
+        if len(valid_points) < 2:
+            continue
+
+        first = valid_points[0]
+        last = valid_points[-1]
+
+        delta_time = float(last['timestamp']['secs']) - float(first['timestamp']['secs'])
+
+        if delta_time > 0:
+            # 수신 대역폭 계산 (Bytes -> MB 변환)
+            # measurement.rs에서 추가한 system_network_in_bytes 필드를 사용
+            delta_in = float(last.get('system_network_in_bytes', 0)) - float(first.get('system_network_in_bytes', 0))
+            in_rate_mbps = (delta_in / delta_time) / (1024 * 1024)
+            in_rates.append(in_rate_mbps)
+
+            # 송신 대역폭 계산 (Bytes -> MB 변환)
+            delta_out = float(last.get('system_network_out_bytes', 0)) - float(first.get('system_network_out_bytes', 0))
+            out_rate_mbps = (delta_out / delta_time) / (1024 * 1024)
+            out_rates.append(out_rate_mbps)
+
+    if not in_rates:
+        return 0, 0
+
+    # 전체 노드의 평균 대역폭 계산
+    avg_in_mbps = sum(in_rates) / len(in_rates)
+    avg_out_mbps = sum(out_rates) / len(out_rates)
+
+    return avg_in_mbps, avg_out_mbps
+
 
 class PlotType(Enum):
     L_GRAPH = 1
@@ -537,6 +589,59 @@ class Plotter:
 
         self._plot_cpu(plot_data)
 
+    # [Added] Plot Network Bandwidth vs TPS
+    def plot_bandwidth_tps(self, workload):
+        plot_data_in = []
+        plot_data_out = []
+
+        transaction_size = self.parameters.transaction_size
+        for n in self.parameters.nodes:
+            for f in self.parameters.faults:
+                filename = self._file_format(transaction_size, f, n, '*')
+                measurements = self._load_measurement_data(filename)
+                measurements.sort(key=lambda x: x['parameters']['load'])
+
+                x_values = []
+                y_in = []
+                y_out = []
+
+                for m in measurements:
+                    tps = aggregate_tps(m, workload[0])
+                    avg_in, avg_out = aggregate_network_bandwidth(m)
+
+                    if tps > 0:
+                        x_values.append(tps)
+                        y_in.append(avg_in)
+                        y_out.append(avg_out)
+
+                if x_values:
+                    id = MeasurementId(measurements[0], workload[0])
+                    # 에러바 없이 평균값만 그래프로 그림
+                    plot_data_in.append((id, x_values, y_in, [0]*len(y_in)))
+                    plot_data_out.append((id, x_values, y_out, [0]*len(y_out)))
+
+        # 수신(Inbound) 대역폭 그래프
+        self._plot_custom(plot_data_in, "Throughput (tx/s)", "Avg Inbound BW (MB/s)", "bandwidth-in.png")
+        # 송신(Outbound) 대역폭 그래프
+        self._plot_custom(plot_data_out, "Throughput (tx/s)", "Avg Outbound BW (MB/s)", "bandwidth-out.png")
+
+    def _plot_custom(self, data, xlabel, ylabel, filename):
+        plt.figure(figsize=(6.4, 4.8))
+        markers = cycle(['o', 'v', 's', 'p', 'D', 'P'])
+
+        for id, x, y, err in data:
+            label = f"{id.nodes} Nodes"
+            plt.plot(x, y, label=label, marker=next(markers), linestyle='-')
+
+        plt.xlabel(xlabel, fontweight='bold')
+        plt.ylabel(ylabel, fontweight='bold')
+        plt.grid(True)
+        plt.legend()
+
+        path = os.path.join(self._make_plot_directory(), filename)
+        plt.savefig(path, bbox_inches='tight')
+        print(f"Generated {path}")
+
     def _plot_cpu(self, data):
         plt.figure(figsize=(6.4, 4.8))
         markers = cycle(['o', 'v', 's', 'p', 'D', 'P'])
@@ -680,6 +785,7 @@ if __name__ == "__main__":
         if args.plot_cpu:
             plotter.plot_tps_cpu(args.workload, args.cores)
             plotter.plot_cpu_over_time(args.cores)
+            plotter.plot_bandwidth_tps(args.workload)
 
     if args.inspect is not None:
         plotter.plot_inspect(args.inspect, args.workload)

@@ -17,7 +17,7 @@ use mysticeti_core::{
     validator::Validator,
 };
 use tracing_subscriber::{filter::LevelFilter, fmt, EnvFilter};
-use mysticeti_core::config::CryptoConfig;
+use mysticeti_core::config::{CryptoConfig, FaultConfig};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -60,6 +60,8 @@ enum Operation {
         client_parameters_path: String,
         #[clap(long, value_name = "FILE")]
         crypto_config_path: String,
+        #[clap(long, value_name = "FILE")]
+        fault_config_path: Option<PathBuf>,
     },
     /// Deploy a local validator for test. Dryrun mode uses default keys and committee configurations.
     DryRun {
@@ -95,6 +97,7 @@ async fn main() -> Result<()> {
             private_config_path,
             client_parameters_path,
             crypto_config_path,
+            fault_config_path,
         } => {
             run(
                 authority,
@@ -103,6 +106,7 @@ async fn main() -> Result<()> {
                 private_config_path,
                 client_parameters_path,
                 crypto_config_path,
+                fault_config_path,
             )
             .await?
         }
@@ -179,6 +183,7 @@ async fn run(
     private_config_path: String,
     client_parameters_path: String,
     crypto_config_path: String,
+    fault_config_path: Option<PathBuf>,
 ) -> Result<()> {
     tracing::info!("Starting validator {authority}");
 
@@ -196,6 +201,12 @@ async fn run(
     let crypto_config = CryptoConfig::load(&crypto_config_path).wrap_err(format!(
         "Failed to crypto configuration file '{crypto_config_path}'"
     ))?;
+    let fault_config = if let Some(path) = fault_config_path {
+        tracing::info!("Loading fault config from {}", path.display());
+        Some(FaultConfig::load(&path).wrap_err("Failed to load fault config")?)
+    } else {
+        None
+    };
 
     let committee = Arc::new(committee);
 
@@ -221,6 +232,7 @@ async fn run(
         private_config,
         client_parameters,
         crypto_config,
+        fault_config
     )
     .await?;
     let (network_result, _metrics_result) = validator.await_completion().await;
@@ -270,6 +282,7 @@ async fn dryrun(authority: AuthorityIndex, committee_size: usize) -> Result<()> 
         private_config,
         client_parameters,
         crypto_config,
+        None
     )
     .await?;
     let (network_result, _metrics_result) = validator.await_completion().await;

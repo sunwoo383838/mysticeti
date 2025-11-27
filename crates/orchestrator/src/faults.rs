@@ -7,10 +7,10 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-
+use mysticeti_core::config::ByzantineType;
 use crate::client::Instance;
 
-#[derive(Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum FaultsType {
     /// Permanently crash the maximum number of nodes from the beginning.
     Permanent { faults: usize },
@@ -18,6 +18,19 @@ pub enum FaultsType {
     CrashRecovery {
         max_faults: usize,
         interval: Duration,
+    },
+    Static {
+        #[serde(default)]
+        crash_nodes: usize,      // 크래시 시킬 노드 수
+        #[serde(default)]
+        crash_delay: Duration,   // 크래시 대기 시간
+
+        #[serde(default)]
+        byzantine_nodes: usize,  // 비잔틴 노드 수
+        #[serde(default)]
+        byzantine_type: Option<ByzantineType>, // 비잔틴 유형 (InvalidProof, DoubleVote 등)
+        #[serde(default)]
+        byzantine_delay: Duration, // 비잔틴 시작 대기 시간
     },
 }
 
@@ -35,6 +48,7 @@ impl Debug for FaultsType {
                 max_faults,
                 interval,
             } => write!(f, "{max_faults}-{}cr", interval.as_secs()),
+            Self::Static { .. } => write!(f, "static-faults"),
         }
     }
 }
@@ -53,6 +67,7 @@ impl Display for FaultsType {
                 max_faults,
                 interval,
             } => write!(f, "{max_faults} crash-recovery, {}s", interval.as_secs()),
+            Self::Static { .. } => write!(f, "Static faults injection"),
         }
     }
 }
@@ -64,6 +79,7 @@ impl FaultsType {
         match self {
             Self::Permanent { .. } => Duration::from_secs(1),
             Self::CrashRecovery { interval, .. } => *interval,
+            Self::Static { .. } => Duration::from_secs(86400),
         }
     }
 }
@@ -168,6 +184,7 @@ impl CrashRecoverySchedule {
                     CrashRecoveryAction::kill(to_kill)
                 }
             }
+            FaultsType::Static { .. } => CrashRecoveryAction::no_op(),
         }
     }
 }

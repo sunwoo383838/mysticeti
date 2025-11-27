@@ -37,6 +37,10 @@ pub struct Measurement {
     /// [Modified] Accumulated CPU usage in seconds (from node_cpu_seconds_total).
     #[serde(default)]
     pub cpu_accumulated_seconds: f64,
+    #[serde(default)]
+    pub system_network_in_bytes: f64,
+    #[serde(default)]
+    pub system_network_out_bytes: f64,
 }
 
 impl Measurement {
@@ -99,6 +103,29 @@ impl Measurement {
                         let is_idle = sample.labels.get("mode").map(|s| s == "idle").unwrap_or(false);
                         if !is_idle {
                             measurement.cpu_accumulated_seconds += val;
+                        }
+                    }
+                },
+                // 1. 수신 대역폭 (Receive)
+                x if x == "node_network_receive_bytes_total" => {
+                    // 'device' 라벨을 확인하여 물리 인터페이스만 집계 (lo 제외)
+                    if let Some(device) = sample.labels.get("device") {
+                        if device != "lo" {
+                            if let prometheus_parse::Value::Counter(val) = sample.value {
+                                measurement.system_network_in_bytes += val;
+                            }
+                        }
+                    }
+                },
+
+                // 2. 송신 대역폭 (Transmit)
+                x if x == "node_network_transmit_bytes_total" => {
+                    // 'device' 라벨을 확인하여 물리 인터페이스만 집계 (lo 제외)
+                    if let Some(device) = sample.labels.get("device") {
+                        if device != "lo" {
+                            if let prometheus_parse::Value::Counter(val) = sample.value {
+                                measurement.system_network_out_bytes += val;
+                            }
                         }
                     }
                 },
@@ -316,6 +343,8 @@ mod test {
             count: 100,
             squared_sum: 0.0,
             cpu_accumulated_seconds: 0.0,
+            system_network_in_bytes: 0.0,
+            system_network_out_bytes: 0.0,
         };
 
         assert_eq!(data.average_latency(), Duration::from_millis(20));
@@ -330,6 +359,8 @@ mod test {
             count: 100,
             squared_sum: 75.0,
             cpu_accumulated_seconds: 0.0,
+            system_network_in_bytes: 0.0,
+            system_network_out_bytes: 0.0,
         };
 
         // squared_sum / count

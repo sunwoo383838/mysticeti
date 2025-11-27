@@ -12,7 +12,7 @@ use ark_groth16::prepare_verifying_key;
 use eyre::{eyre, Context, Result};
 use tokio::sync::{Mutex, Notify};
 use crate::{block_handler, block_handler::{RealBlockHandler, CommitHandler}, block_store::BlockStore, committee::Committee, config::{ClientParameters, NodePrivateConfig, NodePublicConfig}, core::{Core, CoreOptions}, log::TransactionLog, metrics::Metrics, net_sync::NetworkSyncer, network::Network, prometheus, runtime::{JoinError, JoinHandle}, transactions_generator::TransactionGenerator, types::AuthorityIndex, wal::{self, walf}};
-use crate::config::CryptoConfig;
+use crate::config::{CryptoConfig, FaultConfig};
 use crate::dkg_manager::DkgManager;
 use crate::mempool::Mempool;
 use crate::nullifier::NullifierDB;
@@ -30,6 +30,7 @@ impl Validator {
         private_config: NodePrivateConfig,
         client_parameters: ClientParameters,
         crypto_config: CryptoConfig,
+        fault_config: Option<FaultConfig>,
     ) -> Result<Self> {
         let network_address = public_config
             .network_address(authority)
@@ -72,7 +73,7 @@ impl Validator {
         // 🌟 2. (신규) Mempool 생성
         // TransactionGenerator가 트랜잭션을 보낼 Sender(tx_sender_for_generator)와
         // Mempool의 dispatch_loop 태스크 핸들(mempool_handle)을 반환받습니다.
-        let (mempool, tx_sender_for_generator, mempool_handle) = Mempool::new(
+        let (mempool, tx_sender_for_generator) = Mempool::new(
             metrics.clone(),
             nullifier_db.clone(),
             crypto_config.clone(),   // 🌟 crypto_config 전달
@@ -87,6 +88,7 @@ impl Validator {
             metrics.clone(),
             mempool.clone(),
             public_config.parameters.consensus_only,
+            fault_config.clone(),
         );
 
         let committed_transaction_log =
@@ -98,6 +100,7 @@ impl Validator {
             metrics.clone(),
             nullifier_db.clone(),
             committed_transaction_log,
+            &public_config,
         );
 
         let dkg_complete_notify = Arc::new(Notify::new());
@@ -147,7 +150,7 @@ impl Validator {
         let core_syncer_handle = network_synchronizer.core_syncer_handle(); // CoreThreadDispatcher 핸들 복제
         let shutdown_listen_addr = "127.0.0.1:10000".parse().unwrap();
 
-        let shutdown_server_handle = tokio::spawn(async move { // ❗ (A) 바깥쪽 태스크 (소유권 O)
+        tokio::spawn(async move { // ❗ (A) 바깥쪽 태스크 (소유권 O)
             let app = axum::Router::new().route(
                 "/trigger_epoch_close",
                 // ❗❗❗ [수정] 여기에 "move" 키워드 추가 ❗❗❗
@@ -185,6 +188,35 @@ impl Validator {
         *my_secret_share.lock().await = Some(sk);
 
         tracing::info!("[Validator {authority}] DKG 완료. 마스터 공개키 저장됨.");
+
+        if let Some(fault_config) = &fault_config {
+            match fault_config {
+                FaultConfig::Crash { start_delay } => {
+                    let delay = *start_delay;
+                    let authority_index = authority;
+
+                    // 별도의 태스크로 분리하여 메인 로직 방해 없이 타이머 동작
+                    tokio::spawn(async move {
+                        tracing::info!(
+                            "💣 [CrashFault] Scheduled to crash in {} seconds...",
+                            delay.as_secs()
+                        );
+
+                        tokio::time::sleep(delay).await;
+
+                        tracing::error!(
+                            "💣 [CrashFault] CRASHING NOW! (Authority {})",
+                            authority_index
+                        );
+
+                        std::process::exit(1);
+                    });
+                }
+                FaultConfig::Byzantine { .. } => {
+                    tracing::info!("🎭 [ByzantineFault] Configured (logic needed inside Core)");
+                }
+            }
+        }
 
         TransactionGenerator::start(
             tx_sender_for_generator,
@@ -233,7 +265,7 @@ mod smoke_tests {
         prometheus,
         types::AuthorityIndex,
     };
-    use crate::config::CryptoConfig;
+    use crate::config::{CryptoConfig, FaultConfig};
 
     /// Check whether the validator specified by its metrics address has committed at least once.
     async fn check_commit(address: &SocketAddr) -> Result<bool, reqwest::Error> {
@@ -282,6 +314,7 @@ mod smoke_tests {
                 private_config,
                 client_parameters.clone(),
                 crypto_config.clone(),
+                None
             )
             .await
             .unwrap();
@@ -330,6 +363,7 @@ mod smoke_tests {
                 private_config,
                 client_parameters.clone(),
                 crypto_config.clone(),
+                None
             )
             .await
             .unwrap();
@@ -359,6 +393,7 @@ mod smoke_tests {
             private_config,
             client_parameters,
             crypto_config.clone(),
+            None
         )
         .await
         .unwrap();
@@ -406,6 +441,7 @@ mod smoke_tests {
                 private_config,
                 client_parameters.clone(),
                 crypto_config.clone(),
+                None
             )
             .await
             .unwrap();

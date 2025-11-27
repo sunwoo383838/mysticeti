@@ -43,6 +43,7 @@ use crate::block_handler::CommitHandler;
 use crate::committee::{QuorumThreshold, StakeAggregator};
 use crate::dkg_manager::DkgManager;
 use crate::finalization_interpreter::FinalizationInterpreter;
+use crate::syncer::CommitObserver;
 use crate::types::TransactionLocator;
 
 pub struct Core<H: BlockHandler> {
@@ -69,6 +70,9 @@ pub struct Core<H: BlockHandler> {
         HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
     fpc_certificate_aggregator:
         HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>,
+    fpc_block_aggregator: HashMap<BlockReference, HashMap<BlockReference, StakeAggregator<QuorumThreshold>>>,
+    fpc_block_certificate_aggregator: HashMap<BlockReference, StakeAggregator<QuorumThreshold>>,
+    enable_block_fpc: bool,
     dkg_manager: Arc<Mutex<DkgManager>>,
     dkg_complete_notify: Arc<Notify>,
     my_secret_share: Arc<Mutex<Option<Fr>>>,
@@ -184,10 +188,16 @@ impl<H: BlockHandler> Core<H> {
             commit_handler,
             fpc_transaction_aggregator: Default::default(),
             fpc_certificate_aggregator: Default::default(),
+            fpc_block_aggregator: Default::default(),
+            fpc_block_certificate_aggregator: Default::default(),
+            enable_block_fpc: public_config.parameters.enable_block_fpc,
             dkg_manager,
             dkg_complete_notify,
             my_secret_share,
         };
+
+        let transaction_time = this.block_handler.transaction_time();
+        let metrics = this.metrics.clone();
 
         if !unprocessed_blocks.is_empty() {
             tracing::info!(
@@ -202,10 +212,16 @@ impl<H: BlockHandler> Core<H> {
                     &mut this.commit_handler,
                     &mut this.fpc_transaction_aggregator,
                     &mut this.fpc_certificate_aggregator,
+                    &mut this.fpc_block_aggregator,
+                    &mut this.fpc_block_certificate_aggregator,
+                    public_config.parameters.enable_block_fpc,
+                    metrics.clone(),
+                    transaction_time.clone(),
                 );
                 fpc.process_block(block);
             }
-            this.run_block_handler(&unprocessed_blocks);
+            let blocks_to_replay: Vec<_> = unprocessed_blocks.iter().map(|b| (b.clone(), true)).collect();
+            this.run_block_handler(&blocks_to_replay);
         }
 
         this
@@ -217,32 +233,82 @@ impl<H: BlockHandler> Core<H> {
     }
 
     // Note that generally when you update this function you also want to change genesis initialization above
-    pub fn add_blocks(&mut self, blocks: Vec<Data<StatementBlock>>) -> Vec<Data<StatementBlock>> {
+    pub fn add_blocks(
+        &mut self,
+        blocks: Vec<(Data<StatementBlock>, bool)>
+    ) -> Vec<Data<StatementBlock>> {
         let _timer = self
             .metrics
             .utilization_timer
             .utilization_timer("Core::add_blocks");
+
+        // 1. BlockManager에 (Block, bool) 전달
+        // 주의: BlockManager::add_blocks도 (WalPosition, Data<StatementBlock>, bool)을 반환하도록 수정되어야 함
         let processed = self
             .block_manager
             .add_blocks(blocks, &mut (&mut self.wal_writer, &self.block_store));
-        let mut result = Vec::with_capacity(processed.len());
-        for (position, block) in processed.into_iter() {
+
+        let mut result_blocks = Vec::with_capacity(processed.len());
+        let mut blocks_for_handler = Vec::with_capacity(processed.len());
+
+        // 2. 처리된 블록 순회
+        // processed: Vec<(WalPosition, Data<StatementBlock>, bool)>
+        for (position, block, check_individual) in processed.into_iter() {
+            // Threshold Clock 업데이트
             self.threshold_clock
                 .add_block(*block.reference(), &self.committee);
+
+            // Pending 목록에 추가 (복구용)
             self.pending
                 .push_back((position, MetaStatement::Include(*block.reference())));
+
+            let transaction_time = self.block_handler.transaction_time();
+            let metrics = self.metrics.clone();
+
+            // FPC Interpreter 처리 (투표 집계)
+            // 사용자 요구사항: 검증은 여기서 하지 않고, 집계만 수행 (혹은 BlockHandler의 Reject 투표에 의존)
             let mut interpreter = FinalizationInterpreter::new(
                 &self.block_store,
                 self.committee.clone(),
                 &mut self.commit_handler,
                 &mut self.fpc_transaction_aggregator,
                 &mut self.fpc_certificate_aggregator,
+                &mut self.fpc_block_aggregator,
+                &mut self.fpc_block_certificate_aggregator,
+                self.enable_block_fpc,
+                metrics.clone(),
+                transaction_time.clone(),
             );
             interpreter.process_block(&block);
-            result.push(block);
+
+            // 결과 목록 구성
+            result_blocks.push(block.clone());
+
+            // BlockHandler에게 넘길 튜플 구성
+            blocks_for_handler.push((block, check_individual));
         }
-        self.run_block_handler(&result);
-        result
+
+        // 3. BlockHandler 호출 (수정된 시그니처 사용)
+        self.run_block_handler(&blocks_for_handler);
+        result_blocks
+    }
+
+
+
+    pub fn process_committed_leaders(
+        &mut self,
+        committed_leaders: Vec<Data<StatementBlock>>,
+    ) -> (Vec<CommittedSubDag>, Bytes) {
+
+        let sub_dag = self.commit_handler.handle_commit(
+            &self.block_store,
+            committed_leaders,
+            &self.fpc_transaction_aggregator, // 🌟 여기서 안전하게 전달 가능
+        );
+
+        let state = self.commit_handler.aggregator_state();
+
+        (sub_dag, state)
     }
 
     pub fn commit_handler_mut(&mut self) -> &mut CommitHandler {
@@ -269,14 +335,20 @@ impl<H: BlockHandler> Core<H> {
 
 
 
-    fn run_block_handler(&mut self, processed: &[Data<StatementBlock>]) {
+    fn run_block_handler(&mut self, processed: &[(Data<StatementBlock>, bool)]) {
         let _timer = self
             .metrics
             .utilization_timer
             .utilization_timer("Core::run_block_handler");
+
+        // BlockHandler 호출
+        // 여기서 BlockHandler는 check_individual 플래그에 따라
+        // VoteRange(Accept)를 할지, 개별 검증 후 Vote(Reject)를 할지 결정함
         let statements = self
             .block_handler
             .handle_blocks(processed, !self.epoch_changing());
+
+        // 생성된 문(Statement)들을 WAL에 기록하고 Pending에 추가
         let serialized_statements =
             bincode::serialize(&statements).expect("Payload serialization failed");
         let position = self
@@ -607,9 +679,9 @@ mod test {
 
         let mut blocks_r2 = vec![];
         for core in &mut cores {
-            core.add_blocks(blocks.clone());
+            core.add_blocks(blocks.iter().map(|b| (b.clone(), true)).collect());
             assert!(core.try_new_block().is_none());
-            core.add_blocks(more_blocks.clone());
+            core.add_blocks(blocks.iter().map(|b| (b.clone(), true)).collect());
             let block = core
                 .try_new_block()
                 .expect("Must be able to create block after full round");
@@ -619,7 +691,7 @@ mod test {
         }
 
         for core in &mut cores {
-            core.add_blocks(blocks_r2.clone());
+            core.add_blocks(blocks_r2.iter().map(|b| (b.clone(), true)).collect());
             let block = core
                 .try_new_block()
                 .expect("Must be able to create block after full round");
@@ -683,7 +755,7 @@ mod test {
                     continue;
                 }
                 eprint!("Deliver {deliver} to {authority} => ");
-                core.add_blocks(blocks);
+                core.add_blocks(blocks.iter().map(|b| (b.clone(), true)).collect());
                 let Some(block) = core.try_new_block() else {
                     eprintln!("No new block");
                     continue;
@@ -749,9 +821,9 @@ mod test {
 
         let mut blocks_r2 = vec![];
         for core in &mut cores {
-            core.add_blocks(blocks.clone());
+            core.add_blocks(blocks.iter().map(|b| (b.clone(), true)).collect());
             assert!(core.try_new_block().is_none());
-            core.add_blocks(more_blocks.clone());
+            core.add_blocks(more_blocks.iter().map(|b| (b.clone(), true)).collect());
             let block = core
                 .try_new_block()
                 .expect("Must be able to create block after full round");
@@ -769,7 +841,7 @@ mod test {
         let (_committee, mut cores, _) = committee_and_cores_persisted(4, Some(tmp.path()));
 
         for core in &mut cores {
-            core.add_blocks(blocks_r2.clone());
+            core.add_blocks(blocks_r2.iter().map(|b| (b.clone(), true)).collect());
             let block = core
                 .try_new_block()
                 .expect("Must be able to create block after full round");

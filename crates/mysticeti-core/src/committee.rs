@@ -265,6 +265,10 @@ impl<TH: CommitteeThreshold> StakeAggregator<TH> {
         }
     }
 
+    pub fn is_quorum(&self, committee: &Committee) -> bool {
+        TH::is_threshold(committee, self.stake)
+    }
+
     pub fn add(&mut self, vote: AuthorityIndex, committee: &Committee) -> bool {
         let stake = committee.get_stake(vote).expect("Authority not found");
         if self.votes.insert(vote) {

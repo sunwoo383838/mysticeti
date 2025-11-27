@@ -39,7 +39,11 @@ const LATENCY_SEC_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 0.75, 1., 1.25, 1.5, 1.75, 2., 2.5, 3.0, 4.0, 5., 10., 20., 30., 60., 90.,
 ];
 
-/// Metrics collected by the benchmark.
+// Latency Breakdown Buckets (더 정밀한 마이크로초/밀리초 단위 측정용)
+const BREAKDOWN_SEC_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+];
+
 pub const BENCHMARK_DURATION: &str = "benchmark_duration";
 pub const LATENCY_S: &str = "latency_s";
 pub const LATENCY_SQUARED_S: &str = "latency_squared_s";
@@ -52,6 +56,29 @@ pub struct Metrics {
     pub committed_leaders_total: IntCounterVec,
     pub leader_timeout_total: IntCounter,
     pub inter_block_latency_s: HistogramVec,
+
+    // --- [Latency Breakdown Metrics] ---
+    // 1. Queueing (Tx Creation -> Verify Start)
+    pub latency_breakdown_1_queue: HistogramVec,
+    // 2. Verification (Verify Start -> Verify End)
+    pub latency_breakdown_2_verify: HistogramVec,
+    // 3. Pre-Consensus Total (Tx Creation -> Block Creation)
+    //    Batching = This - (Queue + Verify)
+    pub latency_breakdown_pre_consensus: HistogramVec,
+    // 4. Certification (Block Creation -> 2f+1 Votes)
+    pub latency_breakdown_4_cert: HistogramVec,
+    pub latency_breakdown_5_commit: HistogramVec,
+
+    pub latency_breakdown_1_queue_squared_s: CounterVec,
+    pub latency_breakdown_2_verify_squared_s: CounterVec,
+    pub latency_breakdown_pre_consensus_squared_s: CounterVec,
+    pub latency_breakdown_4_cert_squared_s: CounterVec,
+    pub latency_breakdown_5_commit_squared_s: CounterVec,
+
+    // 🌟 [추가 추천] 투표 유형(Accept/Reject) 카운터
+    // 검증 실패 비율을 보기 위해 필수적입니다.
+    pub transaction_votes_total: IntCounterVec,
+
 
     pub block_store_unloaded_blocks: IntCounter,
     pub block_store_loaded_blocks: IntCounter,
@@ -95,8 +122,6 @@ pub struct Metrics {
 }
 
 pub struct MetricReporter {
-    // When adding field here make sure to update
-    // MetricsReporter::receive_all and MetricsReporter::run_report.
     pub transaction_certified_latency: HistogramReporter<Duration>,
     pub certificate_committed_latency: HistogramReporter<Duration>,
     pub transaction_committed_latency: HistogramReporter<Duration>,
@@ -146,6 +171,7 @@ impl Metrics {
                 )
             })
             .unzip();
+
         let reporter = MetricReporter {
             transaction_certified_latency: HistogramReporter::new_in_registry(
                 transaction_certified_latency_hist,
@@ -195,44 +221,39 @@ impl Metrics {
                 "global_in_memory_blocks",
                 "Number of blocks loaded in memory",
                 registry,
-            )
-            .unwrap(),
+            ).unwrap(),
             global_in_memory_blocks_bytes: register_int_gauge_with_registry!(
                 "global_in_memory_blocks_bytes",
                 "Total size of blocks loaded in memory",
                 registry,
-            )
-            .unwrap(),
+            ).unwrap(),
         };
+
         let metrics = Self {
             benchmark_duration: register_int_counter_with_registry!(
                 BENCHMARK_DURATION,
                 "Duration of the benchmark",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             latency_s: register_histogram_vec_with_registry!(
                 LATENCY_S,
                 "Buckets measuring the end-to-end latency of a workload in seconds",
                 &["workload"],
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             latency_squared_s: register_counter_vec_with_registry!(
                 LATENCY_SQUARED_S,
                 "Square of total end-to-end latency of a workload in seconds",
                 &["workload"],
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             committed_leaders_total: register_int_counter_vec_with_registry!(
                 "committed_leaders_total",
                 "Total number of (direct or indirect) committed leaders per authority",
                 &["authority", "commit_type"],
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             inter_block_latency_s: register_histogram_vec_with_registry!(
                 "inter_block_latency_s",
                 "Buckets measuring the inter-block latency in seconds",
@@ -240,119 +261,184 @@ impl Metrics {
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
             ).unwrap(),
+
+            latency_breakdown_1_queue_squared_s: register_counter_vec_with_registry!(
+                "latency_breakdown_1_queue_squared_s",
+                "Squared sum of queueing latency",
+                &["workload"],
+                registry,
+            ).unwrap(),
+
+            latency_breakdown_2_verify_squared_s: register_counter_vec_with_registry!(
+                "latency_breakdown_2_verify_squared_s",
+                "Squared sum of verify latency",
+                &["workload"],
+                registry,
+            ).unwrap(),
+
+            latency_breakdown_pre_consensus_squared_s: register_counter_vec_with_registry!(
+                "latency_breakdown_pre_consensus_squared_s",
+                "Squared sum of pre-consensus latency",
+                &["workload"],
+                registry,
+            ).unwrap(),
+
+            latency_breakdown_4_cert_squared_s: register_counter_vec_with_registry!(
+                "latency_breakdown_4_cert_squared_s",
+                "Squared sum of certification latency",
+                &["workload"],
+                registry,
+            ).unwrap(),
+
+            latency_breakdown_5_commit_squared_s: register_counter_vec_with_registry!(
+                "latency_breakdown_5_commit_squared_s",
+                "Squared sum of commit latency",
+                &["workload"],
+                registry,
+            ).unwrap(),
+
+            // 🌟 [추가] 투표 유형 카운터
+            transaction_votes_total: register_int_counter_vec_with_registry!(
+                "transaction_votes_total",
+                "Total number of votes cast by type (accept/reject)",
+                &["type"],
+                registry,
+            ).unwrap(),
+
+            // [New Breakdown Metrics]
+            latency_breakdown_1_queue: register_histogram_vec_with_registry!(
+                "latency_breakdown_1_queue",
+                "Time from Tx creation to verification start (Queueing)",
+                &["workload"],
+                BREAKDOWN_SEC_BUCKETS.to_vec(),
+                registry,
+            ).unwrap(),
+            latency_breakdown_2_verify: register_histogram_vec_with_registry!(
+                "latency_breakdown_2_verify",
+                "Time taken for cryptographic verification (CPU)",
+                &["workload"],
+                BREAKDOWN_SEC_BUCKETS.to_vec(),
+                registry,
+            ).unwrap(),
+            latency_breakdown_pre_consensus: register_histogram_vec_with_registry!(
+                "latency_breakdown_pre_consensus",
+                "Total time from Tx creation to Block inclusion",
+                &["workload"],
+                LATENCY_SEC_BUCKETS.to_vec(),
+                registry,
+            ).unwrap(),
+            latency_breakdown_4_cert: register_histogram_vec_with_registry!(
+                "latency_breakdown_4_cert",
+                "Time from Block creation to L1 Certification (2f+1 votes)",
+                &["workload"],
+                LATENCY_SEC_BUCKETS.to_vec(),
+                registry,
+            ).unwrap(),
+
+            latency_breakdown_5_commit: register_histogram_vec_with_registry!(
+                "latency_breakdown_4_cert",
+                "Time from Block creation to L1 Certification (2f+1 votes)",
+                &["workload"],
+                LATENCY_SEC_BUCKETS.to_vec(),
+                registry,
+            ).unwrap(),
+
             submitted_transactions: register_int_counter_with_registry!(
                 "submitted_transactions",
                 "Total number of submitted transactions",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             leader_timeout_total: register_int_counter_with_registry!(
                 "leader_timeout_total",
                 "Total number of leader timeouts",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
 
             block_store_loaded_blocks: register_int_counter_with_registry!(
                 "block_store_loaded_blocks",
                 "Blocks loaded from wal position in the block store",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             block_store_unloaded_blocks: register_int_counter_with_registry!(
                 "block_store_unloaded_blocks",
                 "Blocks unloaded from wal position during cleanup",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             block_store_entries: register_int_counter_with_registry!(
                 "block_store_entries",
                 "Number of entries in block store",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             block_store_cleanup_util: register_int_counter_with_registry!(
                 "block_store_cleanup_util",
                 "block_store_cleanup_util",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
 
             wal_mappings: register_int_gauge_with_registry!(
                 "wal_mappings",
                 "Number of mappings retained by the wal",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
 
             core_lock_util: register_int_counter_with_registry!(
                 "core_lock_util",
                 "Utilization of core write lock",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             core_lock_enqueued: register_int_counter_with_registry!(
                 "core_lock_enqueued",
                 "Number of enqueued core requests",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             core_lock_dequeued: register_int_counter_with_registry!(
                 "core_lock_dequeued",
                 "Number of dequeued core requests",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
 
             block_handler_pending_certificates: register_int_gauge_with_registry!(
                 "block_handler_pending_certificates",
                 "Number of pending certificates in block handler",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             block_handler_cleanup_util: register_int_counter_with_registry!(
                 "block_handler_cleanup_util",
                 "block_handler_cleanup_util",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
 
             commit_handler_pending_certificates: register_int_gauge_with_registry!(
                 "commit_handler_pending_certificates",
                 "Number of pending certificates in commit handler",
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
 
             missing_blocks: register_int_gauge_vec_with_registry!(
                 "missing_blocks",
                 "Number of missing blocks per authority",
                 &["authority"],
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             block_sync_requests_sent: register_int_counter_vec_with_registry!(
                 "block_sync_requests_sent",
                 "Number of block sync requests sent per authority",
                 &["authority"],
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
             block_sync_requests_received: register_int_counter_vec_with_registry!(
                 "block_sync_requests_received",
                 "Number of block sync requests received per authority and whether they have been fulfilled",
                 &["authority", "fulfilled"],
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
 
             utilization_timer: register_int_counter_vec_with_registry!(
                 "utilization_timer",
                 "Utilization timer",
                 &["proc"],
                 registry,
-            )
-                .unwrap(),
+            ).unwrap(),
 
             mempool_unverified_transactions: register_int_gauge_with_registry!(
                 "mempool_unverified_transactions",

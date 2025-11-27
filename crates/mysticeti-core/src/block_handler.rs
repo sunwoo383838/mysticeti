@@ -11,6 +11,8 @@ use std::{
 use ark_bls12_381::Fr;
 use minibytes::Bytes;
 use parking_lot::Mutex;
+use rand::seq::index::sample;
+use rayon::prelude::*;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -32,13 +34,16 @@ use crate::{
         TransactionLocator,
     },
 };
-use crate::mempool::Mempool;
+use crate::committee::{StakeAggregator, VoteRangeBuilder};
+use crate::config::{ByzantineType, FaultConfig, NodeParameters, NodePublicConfig};
+use crate::mempool::{Mempool};
 use crate::nullifier::NullifierDB;
+use crate::types::{TransactionLocatorRange, Vote};
 
 pub trait BlockHandler: Send + Sync {
     fn handle_blocks(
         &mut self,
-        blocks: &[Data<StatementBlock>],
+        blocks: &[(Data<StatementBlock>, bool)],
         require_response: bool,
     ) -> Vec<BaseStatement>;
 
@@ -49,6 +54,8 @@ pub trait BlockHandler: Send + Sync {
     fn recover_state(&mut self, _state: &Bytes);
 
     fn cleanup(&self) {}
+
+    fn transaction_time(&self) -> Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>;
 }
 
 const REAL_BLOCK_HANDLER_TXN_SIZE: usize = 512;
@@ -72,6 +79,8 @@ pub struct RealBlockHandler {
     mempool: Arc<Mempool>,
     pending_transactions: usize,
     consensus_only: bool,
+    fault_config: Option<FaultConfig>,
+    start_time: std::time::Instant,
 }
 
 /// The max number of transactions per block.
@@ -87,6 +96,7 @@ impl RealBlockHandler {
         metrics: Arc<Metrics>,
         mempool: Arc<Mempool>,
         consensus_only: bool,
+        fault_config: Option<FaultConfig>
     ) -> Self {
         let transaction_log = TransactionLog::start(certified_transactions_log_path)
             .expect("Failed to open certified transaction log for write");
@@ -100,11 +110,22 @@ impl RealBlockHandler {
             mempool,
             pending_transactions: 0,
             consensus_only,
+            fault_config,
+            start_time: std::time::Instant::now(),
         }
     }
 }
 
 impl RealBlockHandler {
+
+    fn get_active_byzantine_behavior(&self) -> Option<&ByzantineType> {
+        if let Some(FaultConfig::Byzantine { start_delay, behavior }) = &self.fault_config {
+            if self.start_time.elapsed() >= *start_delay {
+                return Some(behavior);
+            }
+        }
+        None
+    }
 
     /// Expose a metric for certified transactions.
     fn update_metrics(
@@ -141,7 +162,7 @@ impl RealBlockHandler {
 impl BlockHandler for RealBlockHandler {
     fn handle_blocks(
         &mut self,
-        blocks: &[Data<StatementBlock>],
+        blocks: &[(Data<StatementBlock>, bool)],
         require_response: bool,
     ) -> Vec<BaseStatement> {
         let current_timestamp = runtime::timestamp_utc();
@@ -149,28 +170,82 @@ impl BlockHandler for RealBlockHandler {
             .metrics
             .utilization_timer
             .utilization_timer("BlockHandler::handle_blocks");
+
         let mut response = vec![];
+
         if require_response {
             let available_capacity = SOFT_MAX_PROPOSED_PER_BLOCK.saturating_sub(self.pending_transactions);
             if available_capacity > 0 {
-                let new_txs = self.mempool.get_verified_transactions(available_capacity);
+                let mut new_txs = self.mempool.get_verified_transactions(available_capacity);
+                // 🌟 [비잔틴 로직 주입]
+                if let Some(behavior) = self.get_active_byzantine_behavior() {
+                    match behavior {
+                        // 시나리오 1: 위조된 증명 (Invalid Proof) - 1/100 랜덤 위조
+                        ByzantineType::InvalidProof => {
+                            let total = new_txs.len();
+                            if total > 0 {
+                                // 1. 위조할 개수 계산 (1/100, 최소 1개 보장)
+                                let corrupt_count = std::cmp::max(1, total / 100);
+                                tracing::warn!(
+                                    "🎭 [Byzantine] Injecting INVALID proofs to {} out of {} transactions!",
+                                    corrupt_count, total
+                                );
+                                // 2. 무작위 인덱스 선택
+                                let mut rng = rand::thread_rng();
+                                let indices = sample(&mut rng, total, corrupt_count);
+                                // 3. 선택된 인덱스의 트랜잭션 오염시키기
+                                for i in indices.iter() {
+                                    let mut corrupted_tx = new_txs[i].clone();
+                                    let mut data = corrupted_tx.into_data();
+                                    // 데이터의 첫 바이트를 변경하여 서명/증명 검증 실패 유도
+                                    if !data.is_empty() {
+                                        data[0] = data[0].wrapping_add(1);
+                                    }
+                                    // 오염된 트랜잭션으로 교체
+                                    new_txs[i] = Transaction::new(data);
+                                }
+                            }
+                        }
+
+                        ByzantineType::DoubleVote => {
+                            let total = new_txs.len();
+                            if total > 0 {
+                                // 1. 복제할 개수 계산 (1/100, 최소 1개)
+                                let duplicate_count = std::cmp::max(1, total / 100);
+                                tracing::warn!(
+                                    "🎭 [Byzantine] Injecting DOUBLE votes for {}/{} txs",
+                                    duplicate_count, total
+                                );
+                                // 2. 무작위 인덱스 선택
+                                let mut rng = rand::thread_rng();
+                                let indices = sample(&mut rng, total, duplicate_count);
+
+                                let mut duplicates = Vec::with_capacity(duplicate_count);
+                                for i in indices.iter() {
+                                    duplicates.push(new_txs[i].clone());
+                                }
+
+                                // 원본 리스트에 중복 트랜잭션 추가
+                                new_txs.extend(duplicates);
+                            }
+                        }
+                    }
+                }
                 self.pending_transactions += new_txs.len();
                 for tx in new_txs {
                     response.push(BaseStatement::Share(tx));
                 }
             }
         }
+
         let transaction_time = self.transaction_time.lock();
-        for block in blocks {
-            let response_option: Option<&mut Vec<BaseStatement>> = if require_response {
-                Some(&mut response)
-            } else {
-                None
-            };
+
+        for (block, check_individual) in blocks {
             if !self.consensus_only {
                 let processed =
                     self.transaction_votes
-                        .process_block(block, response_option, &self.committee);
+                        .process_block(block, None, &self.committee);
+
                 for processed_locator in processed {
                     let block_creation = transaction_time.get(&processed_locator);
                     let transaction = self
@@ -180,19 +255,102 @@ impl BlockHandler for RealBlockHandler {
                     self.update_metrics(block_creation, &transaction, &current_timestamp);
                 }
             }
+
+            if require_response {
+                if !*check_individual {
+                    for range in block.shared_ranges() {
+                        response.push(BaseStatement::VoteRange(range));
+                    }
+                } else {
+                    // [전략 2] Primitive FPC (개별 검증 + 효율적 투표)
+
+                    // (A) 검증할 트랜잭션들을 수집합니다.
+                    // shared_transactions()는 (Locator, &Transaction)을 반환합니다.
+                    let txs_with_locators: Vec<_> = block.shared_transactions().collect();
+
+                    // Mempool에 넘기기 위해 &Transaction만 별도 벡터로 추출
+                    let tx_refs: Vec<&Transaction> = txs_with_locators.iter().map(|(_, tx)| *tx).collect();
+
+                    // (B) Mempool에 배치 검증 요청 🚀
+                    // 내부적으로 Rayon을 사용하며, VK/Root 로딩 오버헤드를 최소화했습니다.
+                    let verification_results = self.mempool.verify_transactions(&tx_refs);
+
+                    // (C) 검증 결과를 순회하며 VoteRange와 Reject를 구성
+                    let mut vote_range_builder = VoteRangeBuilder::default();
+
+                    // txs_with_locators와 verification_results의 길이는 같음이 보장됩니다.
+                    for ((locator, _), is_valid) in txs_with_locators.into_iter().zip(verification_results.into_iter()) {
+                        let offset = locator.offset();
+
+                        if is_valid {
+                            // 유효함: VoteRangeBuilder에 추가 (여기서 에러가 났던 이유는 else 블록에서 이동되었기 때문)
+                            // 이제 else 블록에서 다시 살려내므로 안전합니다.
+                            if let Some(range) = vote_range_builder.add(offset) {
+                                let range = TransactionLocatorRange::new(*block.reference(), range);
+                                response.push(BaseStatement::VoteRange(range));
+                            }
+                            self.metrics.transaction_votes_total.with_label_values(&["accept"]).inc();
+                        } else {
+                            // 유효하지 않음 (검증 실패):
+
+                            // 1. 기존 범위 Flush (여기서 vote_range_builder의 소유권이 이동됨!)
+                            let finished_range = vote_range_builder.finish();
+
+                            // 🌟 [핵심 수정] 소유권이 이동된 변수에 새 인스턴스를 즉시 할당하여 부활시킵니다.
+                            // 이렇게 해야 다음 루프의 if is_valid 블록에서 add()를 호출할 수 있습니다.
+                            vote_range_builder = VoteRangeBuilder::default();
+
+                            // Flush된 범위 처리
+                            if let Some(range) = finished_range {
+                                let range = TransactionLocatorRange::new(*block.reference(), range);
+                                response.push(BaseStatement::VoteRange(range));
+                            }
+
+                            // 2. 명시적 Reject 투표
+                            tracing::debug!("Rejecting invalid tx {}", locator);
+                            response.push(BaseStatement::Vote(locator, Vote::Reject(None)));
+                            self.metrics.transaction_votes_total.with_label_values(&["reject"]).inc();
+
+                            // 3. 빌더는 위에서 새로 만들었으므로 초기화 상태입니다.
+                        }
+                    }
+
+                    // (D) 루프 종료 후 남은 유효 범위 처리 (Flush remaining)
+                    if let Some(range) = vote_range_builder.finish() {
+                        let range = TransactionLocatorRange::new(*block.reference(), range);
+                        response.push(BaseStatement::VoteRange(range));
+                    }
+                }
+            }
         }
+
         self.metrics
             .block_handler_pending_certificates
             .set(self.transaction_votes.len() as i64);
+
         response
     }
 
     fn handle_proposal(&mut self, block: &Data<StatementBlock>) {
-        // todo - this is not super efficient
         self.pending_transactions -= block.shared_transactions().count();
         let mut transaction_time = self.transaction_time.lock();
-        for (locator, _) in block.shared_transactions() {
+
+        // [Latency 3] Batching Time Calculation
+        // Pre-Consensus Total = Block Time - Tx Creation Time
+        let block_time = runtime::timestamp_utc();
+
+        for (locator, tx) in block.shared_transactions() {
             transaction_time.insert(locator, TimeInstant::now());
+
+            let tx_time = Duration::from_millis(tx.timestamp);
+            let pre_consensus_latency = block_time.saturating_sub(tx_time);
+
+            self.metrics.latency_breakdown_pre_consensus
+                .with_label_values(&["shared"])
+                .observe(pre_consensus_latency.as_secs_f64());
+            self.metrics.latency_breakdown_pre_consensus_squared_s
+                .with_label_values(&["shared"])
+                .inc_by(pre_consensus_latency.as_secs_f64().powi(2));
         }
         if !self.consensus_only {
             for range in block.shared_ranges() {
@@ -200,6 +358,10 @@ impl BlockHandler for RealBlockHandler {
                     .register(range, self.authority, &self.committee);
             }
         }
+    }
+
+    fn transaction_time(&self) -> Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>> {
+        self.transaction_time.clone()
     }
 
     fn state(&self) -> Bytes {
@@ -261,13 +423,13 @@ impl TestBlockHandler {
 impl BlockHandler for TestBlockHandler {
     fn handle_blocks(
         &mut self,
-        blocks: &[Data<StatementBlock>],
+        blocks: &[(Data<StatementBlock>, bool)],
         require_response: bool,
     ) -> Vec<BaseStatement> {
         // todo - this is ugly, but right now we need a way to recover self.last_transaction
         let mut response = vec![];
         if require_response {
-            for block in blocks {
+            for (block, _) in blocks {
                 if block.author() == self.authority {
                     // We can see our own block in handle_blocks - this can happen during core recovery
                     // Todo - we might also need to process pending Payload statements as well
@@ -283,7 +445,7 @@ impl BlockHandler for TestBlockHandler {
             response.push(BaseStatement::Share(next_transaction));
         }
         let transaction_time = self.transaction_time.lock();
-        for block in blocks {
+        for (block, _) in blocks {
             tracing::debug!("Processing {block:?}");
             let response_option: Option<&mut Vec<BaseStatement>> = if require_response {
                 Some(&mut response)
@@ -323,6 +485,10 @@ impl BlockHandler for TestBlockHandler {
         bytes.into()
     }
 
+    fn transaction_time(&self) -> Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>> {
+        self.transaction_time.clone()
+    }
+
     fn recover_state(&mut self, state: &Bytes) {
         let (transaction_votes, last_transaction) = bincode::deserialize(state)
             .expect("Failed to deserialize transaction aggregator state");
@@ -332,7 +498,7 @@ impl BlockHandler for TestBlockHandler {
 }
 
 pub trait LedgerWriter: Send + Sync {
-    fn write_finalized_vote(&mut self, vote: TransactionLocator, block_store: &BlockStore);
+    fn write_finalized_vote(&mut self, vote: TransactionLocator, block_store: &BlockStore, is_fpc: bool);
     fn is_vote_finalized(&self, vote: &TransactionLocator) -> bool;
 }
 
@@ -346,6 +512,7 @@ pub struct CommitHandler {
 
     metrics: Arc<Metrics>,
     consensus_only: bool,
+    enable_block_fpc: bool,
 
     commit_log: TransactionLog,
     nullifier_db: Arc<NullifierDB>, // << NullifierDB 필드
@@ -359,6 +526,7 @@ impl CommitHandler {
         metrics: Arc<Metrics>,
         nullifier_db: Arc<NullifierDB>,
         transaction_log: TransactionLog,
+        node_public_config: &NodePublicConfig,
     ) -> Self {
         let consensus_only = env::var("CONSENSUS_ONLY").is_ok();
 
@@ -373,6 +541,7 @@ impl CommitHandler {
             nullifier_db,
             finalized_cache: HashSet::new(), // 복구 로직(recover_committed)에서 채워져야 함
             commit_log: transaction_log,
+            enable_block_fpc: node_public_config.parameters.enable_block_fpc,
         }
     }
 
@@ -390,6 +559,7 @@ impl CommitHandler {
         block_creation: Option<&TimeInstant>,
         current_timestamp: Duration,
         transaction: &Transaction,
+        is_fpc: bool,
     ) {
         // Record inter-block latency.
         if let Some(instant) = block_creation {
@@ -403,6 +573,16 @@ impl CommitHandler {
                 .inter_block_latency_s
                 .with_label_values(&["shared"])
                 .observe(latency.as_secs_f64());
+
+            // [Latency 5] Finalization (Consensus) Time
+            // Block Creation -> Commit
+            let path_type = if is_fpc { "fpc" } else { "c" };
+            self.metrics.latency_breakdown_5_commit
+                .with_label_values(&["shared", path_type])
+                .observe(latency.as_secs_f64());
+            self.metrics.latency_breakdown_5_commit_squared_s
+                .with_label_values(&["shared", path_type])
+                .inc_by(latency.as_secs_f64().powi(2));
         }
 
         // Record benchmark start time.
@@ -429,7 +609,7 @@ impl CommitHandler {
 }
 
 impl LedgerWriter for CommitHandler {
-    fn write_finalized_vote(&mut self, vote: TransactionLocator, block_store: &BlockStore) {
+    fn write_finalized_vote(&mut self, vote: TransactionLocator, block_store: &BlockStore, is_fpc: bool) {
         if !self.finalized_cache.insert(vote) {
             return;
         }
@@ -463,6 +643,7 @@ impl LedgerWriter for CommitHandler {
             block_creation_time,
             current_timestamp,
             &transaction,
+            is_fpc
         );
     }
 
@@ -480,6 +661,7 @@ impl CommitObserver for CommitHandler {
         &mut self,
         block_store: &BlockStore,
         committed_leaders: Vec<Data<StatementBlock>>,
+        transaction_aggregator: &HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
     ) -> Vec<CommittedSubDag> {
 
         // C-Path가 순서 매긴 블록 목록을 가져옴
@@ -489,34 +671,53 @@ impl CommitObserver for CommitHandler {
 
         for commit in &committed {
             self.committed_leaders.push(commit.anchor);
+
             for block in &commit.blocks {
-
-                // FPC 모드일 때의 'transaction_votes.process_block' 로직은 여기서 제거됨
-                // (if !self.consensus_only { ... } 부분 제거)
-
-                // C-Path로 확정된 모든 트랜잭션을 순회
                 for (locator, _transaction) in block.shared_transactions() {
 
-                    // C-Path Fallback: FPC가 이 트랜잭션을 놓쳤는지 확인
-                    if !self.is_vote_finalized(&locator) {
-                        // FPC가 놓쳤으므로 C-Path가 구제
-                        tracing::warn!("C-PATH FALLBACK: Finalizing transaction {}", locator);
-
-                        // LedgerWriter::write_finalized_vote 호출
-                        // (이 함수가 장부/DB/메트릭을 모두 처리)
-                        self.write_finalized_vote(locator, block_store);
+                    // 1. 이미 FPC로 최종화된 트랜잭션은 스킵 (중복 실행 방지)
+                    if self.is_vote_finalized(&locator) {
+                        continue;
                     }
 
-                    // E2E 메트릭은 write_finalized_vote 내부에서 처리되므로
-                    // 여기서 update_metrics를 중복 호출할 필요가 없음.
+                    // 🌟 [수정 5] C-Path Fallback 로직 분기
+                    let should_finalize = if self.enable_block_fpc {
+                        // [전략 1: Block Level FPC]
+                        // C-Path가 커밋했다면, 해당 블록은 NetSync에서 배치 검증을 통과한 것임.
+                        // 따라서 블록 내 모든 트랜잭션을 안전하게 최종화.
+                        true
+                    } else {
+                        // [전략 2: Transaction Level FPC]
+                        // C-Path가 커밋했더라도, 개별 트랜잭션의 유효성은 보장되지 않음 (Reject 됐을 수 있음).
+                        // 따라서 "L1 인증서(2f+1 Vote)"가 존재하는지 확인해야 함.
+
+                        // 해당 블록의 투표 맵 조회
+                        if let Some(block_aggs) = transaction_aggregator.get(block.reference()) {
+                            // 해당 트랜잭션의 투표 집계 조회
+                            if let Some(stake_agg) = block_aggs.get(&locator) {
+                                // 2f+1 쿼럼 확인 (StakeAggregator에 is_quorum 메서드 필요)
+                                stake_agg.is_quorum(&self.committee)
+                            } else {
+                                false // 투표 정보 없음 (Reject 됨)
+                            }
+                        } else {
+                            false // 블록 정보 없음
+                        }
+                    };
+
+                    if should_finalize {
+                        tracing::warn!("C-PATH FALLBACK: Finalizing transaction {}", locator);
+                        // is_fpc = false (C-Path에 의한 커밋임을 표시)
+                        self.write_finalized_vote(locator, block_store, false);
+                    } else {
+                        // [전략 2]에서 검증 실패로 인해 투표를 못 받은 트랜잭션은 여기서 최종적으로 버려짐
+                        if !self.enable_block_fpc {
+                            tracing::debug!("Skipping invalid/unsupported tx {} in committed block", locator);
+                        }
+                    }
                 }
             }
         }
-
-        // FPC Aggregator가 제거되었으므로 관련 메트릭도 제거
-        // self.metrics
-        //     .commit_handler_pending_certificates
-        //     .set(self.transaction_votes.len() as i64);
 
         committed
     }

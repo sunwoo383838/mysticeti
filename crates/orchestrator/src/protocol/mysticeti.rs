@@ -107,6 +107,13 @@ impl ProtocolCommands for MysticetiProtocol {
             node_parameters_path.display()
         );
 
+        let mut fault_config_commands = Vec::new();
+        for (node_idx, fault_config) in &parameters.fault_assignments {
+            let f_str = serde_yaml::to_string(fault_config).unwrap();
+            let f_path = self.working_dir.join(format!("fault-config-{}.yaml", node_idx));
+            fault_config_commands.push(format!("echo -e '{f_str}' > {}", f_path.display()));
+        }
+
         let mut client_parameters = parameters.client_parameters.clone();
         client_parameters.0.load = parameters.load / parameters.nodes;
         let client_parameters_string = serde_yaml::to_string(&client_parameters).unwrap();
@@ -127,19 +134,22 @@ impl ProtocolCommands for MysticetiProtocol {
         ]
             .join(" ");
 
-        [
-            "source $HOME/.cargo/env",
-            &upload_node_parameters,
-            &upload_client_parameters,
-            &genesis,
-        ]
-            .join(" && ")
+        let mut commands = vec![
+            "source $HOME/.cargo/env".to_string(),
+            upload_node_parameters,
+        ];
+        // 🌟 장애 설정 파일 생성 명령 추가
+        commands.extend(fault_config_commands);
+        commands.push(upload_client_parameters);
+        commands.push(genesis);
+
+        commands.join(" && ")
     }
 
     fn node_command<I>(
         &self,
         instances: I,
-        _parameters: &BenchmarkParameters,
+        parameters  : &BenchmarkParameters,
     ) -> Vec<(Instance, String)>
     where
         I: IntoIterator<Item = Instance>,
@@ -156,6 +166,13 @@ impl ProtocolCommands for MysticetiProtocol {
                     .join(format!("private-config-{authority}.yaml"));
                 let client_parameters_path = self.working_dir.join("client-parameters.yaml");
                 let crypto_config_path = self.working_dir.join("crypto-config.yaml");
+                // 🌟 [신규] 장애 설정 파일 경로 옵션 생성
+                let fault_arg = if parameters.fault_assignments.contains_key(&i) {
+                    let path = self.working_dir.join(format!("fault-config-{}.yaml", i));
+                    format!("--fault-config-path {}", path.display())
+                } else {
+                    String::new()
+                };
 
                 let run = [
                     "RUST_LOG=info,mysticeti_core=debug,mysticeti=debug",
@@ -173,6 +190,7 @@ impl ProtocolCommands for MysticetiProtocol {
                         "--crypto-config-path {}",
                         crypto_config_path.display()
                     ),
+                    &fault_arg,
                 ]
                     .join(" ");
 

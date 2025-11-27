@@ -130,6 +130,7 @@ pub fn committee_and_cores_persisted_epoch_duration(
                 metrics.clone(),
                 nullifier_db,
                 committed_transaction_log,
+                &public_config,
             );
 
             let dkg_complete_notify = Arc::new(Notify::new());

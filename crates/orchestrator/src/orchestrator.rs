@@ -9,10 +9,12 @@ use std::{
 use std::path::Path;
 use std::time::Duration;
 use futures::future::join_all;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
-
+use mysticeti_core::config::FaultConfig;
 use crate::{
     benchmark::BenchmarkParameters,
     client::Instance,
@@ -27,6 +29,7 @@ use crate::{
     settings::Settings,
     ssh::{CommandContext, CommandStatus, SshConnectionManager},
 };
+use crate::faults::FaultsType;
 
 /// An orchestrator to deploy nodes and run benchmarks on a testbed.
 pub struct Orchestrator<P> {
@@ -346,7 +349,7 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         let commit = &self.settings.repository.commit;
         let command = [
             &format!("git fetch origin"),
-            &format!("git reset --hard origin/{commit}"),            "source $HOME/.cargo/env",
+            &format!("git reset --hard origin/{commit}"), "source $HOME/.cargo/env",
             "RUSTFLAGS=-Ctarget-cpu=native cargo build --release",
         ]
             .join(" && ");
@@ -579,14 +582,34 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
                     let mut instances = metrics_commands.clone();
                     instances.retain(|(instance, _)| !killed_nodes.contains(instance));
 
-                    let stdio = self
-                        .ssh_manager
-                        .execute_per_instance(instances, CommandContext::default())
-                        .await?;
+                    // 변경: 각 인스턴스별로 병렬 실행하되, 실패(Crash된 노드)는 무시
+                    let futures: Vec<_> = instances.iter().map(|(instance, command)| {
+                        let manager = self.ssh_manager.clone();
+                        let instance = instance.clone();
+                        let cmd = command.clone();
+                        let context = CommandContext::default();
 
-                    for (i, (stdout, _stderr)) in stdio.iter().enumerate() {
-                        for (label, measurement) in Measurement::from_prometheus::<P>(stdout) {
-                            aggregator.add(i, label, measurement);
+                        // 개별 태스크로 스폰
+                        tokio::spawn(async move {
+                            // execute는 내부적으로 재시도를 하므로, 노드가 죽으면 여기서 에러가 남
+                            match manager.execute(std::iter::once(instance.clone()), cmd, context).await {
+                                Ok(mut res) => Some((instance, res.pop().unwrap().0)), // (인스턴스, stdout)
+                                Err(_) => None, // 🌟 실패 시(노드 사망) 무시하고 None 반환
+                            }
+                        })
+                    }).collect();
+
+                    let results = join_all(futures).await;
+
+                    // 성공한 결과만 파싱하여 집계
+                    for res in results.into_iter().flatten().flatten() {
+                        let (instance, stdout) = res;
+
+                        // (간편한 매핑을 위해 nodes 리스트에서 인덱스 찾기)
+                        let scraper_id = nodes.iter().position(|n| n.id == instance.id).unwrap_or(0);
+
+                        for (label, measurement) in Measurement::from_prometheus::<P>(&stdout) {
+                            aggregator.add(scraper_id, label, measurement);
                         }
                     }
 
@@ -692,115 +715,165 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             .expect("At least one log parser"))
     }
 
-    /// Run all the benchmarks specified by the benchmark generator.
-    pub async fn run_benchmarks(
-        &mut self,
-        set_of_parameters: Vec<BenchmarkParameters>,
-    ) -> TestbedResult<()> {
-        display::header("Preparing testbed");
-        display::config("Commit", format!("'{}'", &self.settings.repository.commit));
-        display::newline();
+    // 🌟 [신규] 장애 할당 헬퍼 메서드
+    fn assign_faults(&self, parameters: &mut BenchmarkParameters) {
+        let mut rng = thread_rng();
+        let mut indices: Vec<usize> = (0..parameters.nodes).collect();
+        indices.shuffle(&mut rng); // 노드 인덱스 섞기
 
-        let local_batch_files_path = Path::new("benchmark_batches/n10_t7_k7000000");
+        let mut assigned_count = 0;
 
-        // Cleanup the testbed (in case the previous run was not completed).
-        self.cleanup(true).await?;
+        // 설정 확인
+        if let FaultsType::Static {
+            crash_nodes, crash_delay,
+            byzantine_nodes, byzantine_type, byzantine_delay
+        } = &self.settings.faults {
 
-        // Update the software on all instances.
-        if !self.skip_testbed_update {
-            self.install().await?;
-            self.update().await?;
+            // 1. Crash 노드 할당
+            for _ in 0..*crash_nodes {
+                if assigned_count >= indices.len() { break; }
+                let node_idx = indices[assigned_count];
+                parameters.fault_assignments.insert(
+                    node_idx,
+                    FaultConfig::Crash { start_delay: *crash_delay }
+                );
+                assigned_count += 1;
+                display::header(format!("Node {node_idx} assigned as CRASH fault"));
+                display::newline();
+            }
+
+            // 2. Byzantine 노드 할당
+            if let Some(b_type) = byzantine_type {
+                for _ in 0..*byzantine_nodes {
+                    if assigned_count >= indices.len() { break; }
+                    let node_idx = indices[assigned_count];
+                    parameters.fault_assignments.insert(
+                        node_idx,
+                        FaultConfig::Byzantine {
+                            start_delay: *byzantine_delay,
+                            behavior: b_type.clone()
+                        }
+                    );
+                    assigned_count += 1;
+                    display::header(format!("Node {node_idx} assigned as BYZANTINE fault"));
+                    display::newline();
+                }
+            }
         }
+    }
 
-        // Run all benchmarks.
-        let mut i = 1;
-        let mut latest_committee_size = 0;
-        for parameters in set_of_parameters {
-            display::header(format!("Starting benchmark {i}"));
-            display::config("Node Parameters", &parameters.node_parameters);
-            display::config("Benchmark Parameters", &parameters);
+    /// Run all the benchmarks specified by the benchmark generator.
+        pub async fn run_benchmarks(
+            &mut self,
+            mut set_of_parameters: Vec<BenchmarkParameters>,
+        ) -> TestbedResult<()> {
+            display::header("Preparing testbed");
+            display::config("Commit", format!("'{}'", &self.settings.repository.commit));
             display::newline();
+
+            let local_batch_files_path = Path::new("benchmark_batches/n10_t7_k7000000");
 
             // Cleanup the testbed (in case the previous run was not completed).
             self.cleanup(true).await?;
-            // Start the instance monitoring tools.
-            self.start_monitoring(&parameters).await?;
 
-            if local_batch_files_path.exists() {
-                self.distribute_batch_files(local_batch_files_path, &parameters).await?;
-            } else {
-                display::warn(format!("Local staging directory for batch files not found: {}. Skipping file distribution.", local_batch_files_path.display()));
+            // Update the software on all instances.
+            if !self.skip_testbed_update {
+                self.install().await?;
+                self.update().await?;
             }
 
-            // Configure all instances (if needed).
-            if !self.skip_testbed_configuration && latest_committee_size != parameters.nodes {
-                self.configure(&parameters).await?;
-                latest_committee_size = parameters.nodes;
-            }
+            // Run all benchmarks.
+            let mut i = 1;
+            let mut latest_committee_size = 0;
+            for parameters in &mut set_of_parameters {
+                // 🌟 [신규] 장애 노드 랜덤 할당 로직 실행
+                self.assign_faults(parameters);
+                display::header(format!("Starting benchmark {i}"));
+                display::config("Node Parameters", &parameters.node_parameters);
+                display::config("Benchmark Parameters", &parameters);
+                display::newline();
 
+                // Cleanup the testbed (in case the previous run was not completed).
+                self.cleanup(true).await?;
+                // Start the instance monitoring tools.
+                self.start_monitoring(&parameters).await?;
 
-            // ❗ (신규) 노드 목록을 미리 가져옵니다 (종료 신호를 보내기 위해)
-            let (clients, nodes, _) = self.select_instances(&parameters)?;
-
-            // Deploy the validators.
-            self.run_nodes(&parameters).await?;
-            if parameters.settings.benchmark_duration.as_secs() == 0 {
-                return Ok(());
-            }
-
-            // Deploy the load generators.
-            self.run_clients(&parameters).await?;
-
-            // 1. 실제 벤치마크 시간 (예: 3분)
-            let benchmark_duration = parameters.settings.benchmark_duration;
-
-            // 2. 벤치마크 종료 후, 노드가 동기화하고 Tally 프로토콜을 실행할 추가 시간
-            //    (이 값은 settings.yml에 추가하는 것이 좋습니다)
-            let tally_grace_period = Duration::from_secs(60); // 예: 1분
-
-            // 3. 오케스트레이터가 메트릭을 수집하며 기다릴 총 시간 (예: 4분)
-            let total_orchestrator_wait = benchmark_duration + tally_grace_period;
-
-            // 4. (신규) 3분 뒤에 노드에 "우아한 종료" 신호를 보낼 별도 태스크 실행
-            let ssh_manager_clone = self.ssh_manager.clone();
-            let nodes_clone = nodes.clone();
-            tokio::spawn(async move {
-                // 1. 실제 벤치마크 시간(3분)만큼 대기
-                tokio::time::sleep(benchmark_duration).await;
-
-                // 2. 모든 노드에 "우아한 종료" 신호 전송
-                //    (이 엔드포인트는 validator.rs에 구현되어 있어야 함)
-                display::action("Benchmark duration elapsed. Triggering graceful shutdown on nodes...");
-                let command = "curl -s http://127.0.0.1:10000/trigger_epoch_close";
-                let context = CommandContext::default();
-                if let Err(e) = ssh_manager_clone.execute(nodes_clone, command, context).await {
-                    display::warn(format!("Failed to send graceful shutdown trigger: {}", e));
+                if local_batch_files_path.exists() {
+                    self.distribute_batch_files(local_batch_files_path, &parameters).await?;
+                } else {
+                    display::warn(format!("Local staging directory for batch files not found: {}. Skipping file distribution.", local_batch_files_path.display()));
                 }
-                display::done();
-            });
 
-            // 5. (수정) `self.run`이 총 4분(total_orchestrator_wait)을 기다리도록
-            //    파라미터를 복제하여 수정합니다.
-            let mut run_parameters = parameters.clone();
-            run_parameters.settings.benchmark_duration = total_orchestrator_wait;
+                // Configure all instances (if needed).
+                if !self.skip_testbed_configuration && latest_committee_size != parameters.nodes {
+                    self.configure(&parameters).await?;
+                    latest_committee_size = parameters.nodes;
+                }
 
-            // `run` 함수가 4분 동안 메트릭을 수집
-            let aggregator = self.run(&run_parameters).await?;
-            aggregator.display_summary();
 
-            // Kill the nodes and clients (without deleting the log files).
-            self.cleanup(false).await?;
+                // ❗ (신규) 노드 목록을 미리 가져옵니다 (종료 신호를 보내기 위해)
+                let (clients, nodes, _) = self.select_instances(&parameters)?;
 
-            // Download the log files.
-            if self.settings.log_processing {
-                let error_counter = self.download_logs(&parameters).await?;
-                error_counter.print_summary();
+                // Deploy the validators.
+                self.run_nodes(&parameters).await?;
+                if parameters.settings.benchmark_duration.as_secs() == 0 {
+                    return Ok(());
+                }
+
+                // Deploy the load generators.
+                self.run_clients(&parameters).await?;
+
+                // 1. 실제 벤치마크 시간 (예: 3분)
+                let benchmark_duration = parameters.settings.benchmark_duration;
+
+                // 2. 벤치마크 종료 후, 노드가 동기화하고 Tally 프로토콜을 실행할 추가 시간
+                //    (이 값은 settings.yml에 추가하는 것이 좋습니다)
+                let tally_grace_period = Duration::from_secs(60); // 예: 1분
+
+                // 3. 오케스트레이터가 메트릭을 수집하며 기다릴 총 시간 (예: 4분)
+                let total_orchestrator_wait = benchmark_duration + tally_grace_period;
+
+                // 4. (신규) 3분 뒤에 노드에 "우아한 종료" 신호를 보낼 별도 태스크 실행
+                let ssh_manager_clone = self.ssh_manager.clone();
+                let nodes_clone = nodes.clone();
+                tokio::spawn(async move {
+                    // 1. 실제 벤치마크 시간(3분)만큼 대기
+                    tokio::time::sleep(benchmark_duration).await;
+
+                    // 2. 모든 노드에 "우아한 종료" 신호 전송
+                    //    (이 엔드포인트는 validator.rs에 구현되어 있어야 함)
+                    display::action("Benchmark duration elapsed. Triggering graceful shutdown on nodes...");
+                    let command = "curl -s http://127.0.0.1:10000/trigger_epoch_close";
+                    let context = CommandContext::default();
+                    if let Err(e) = ssh_manager_clone.execute(nodes_clone, command, context).await {
+                        display::warn(format!("Failed to send graceful shutdown trigger: {}", e));
+                    }
+                    display::done();
+                });
+
+                // 5. (수정) `self.run`이 총 4분(total_orchestrator_wait)을 기다리도록
+                //    파라미터를 복제하여 수정합니다.
+                let mut run_parameters = parameters.clone();
+                run_parameters.settings.benchmark_duration = total_orchestrator_wait;
+
+                // `run` 함수가 4분 동안 메트릭을 수집
+                let aggregator = self.run(&run_parameters).await?;
+                aggregator.display_summary();
+
+                // Kill the nodes and clients (without deleting the log files).
+                self.cleanup(false).await?;
+
+                // Download the log files.
+                if self.settings.log_processing {
+                    let error_counter = self.download_logs(&parameters).await?;
+                    error_counter.print_summary();
+                }
+
+                i += 1;
             }
 
-            i += 1;
+            display::header("Benchmark completed");
+            Ok(())
         }
-
-        display::header("Benchmark completed");
-        Ok(())
     }
-}
+

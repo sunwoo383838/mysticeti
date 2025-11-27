@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{collections::HashSet, sync::Arc};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use minibytes::Bytes;
 
@@ -16,6 +17,8 @@ use crate::{
     types::{AuthorityIndex, BlockReference, RoundNumber, StatementBlock},
 };
 use crate::block_handler::CommitHandler;
+use crate::committee::{QuorumThreshold, StakeAggregator};
+use crate::types::TransactionLocator;
 
 pub struct Syncer<H: BlockHandler, S: SyncerSignals> {
     core: Core<H>,
@@ -35,6 +38,7 @@ pub trait CommitObserver: Send + Sync {
         &mut self,
         block_store: &BlockStore,
         committed_leaders: Vec<Data<StatementBlock>>,
+        transaction_aggregator: &HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
     ) -> Vec<CommittedSubDag>;
 
     fn aggregator_state(&self) -> Bytes;
@@ -60,7 +64,7 @@ impl<H: BlockHandler, S: SyncerSignals> Syncer<H, S> {
         }
     }
 
-    pub fn add_blocks(&mut self, blocks: Vec<Data<StatementBlock>>) {
+    pub fn add_blocks(&mut self, blocks: Vec<(Data<StatementBlock>, bool)>) {
         let _timer = self
             .metrics
             .utilization_timer
@@ -114,28 +118,19 @@ impl<H: BlockHandler, S: SyncerSignals> Syncer<H, S> {
                     .collect();
                 tracing::debug!("Committed {:?}", committed_refs);
             }
-            let block_store_clone = self.core.block_store().clone();
 
-            // 2. 명시적인 스코프({})를 사용하여 commit_handler의 가변 대여(mutable borrow) 범위를 제한합니다.
-            let (committed_subdag, aggregator_state) = {
-                let commit_handler = self.core.commit_handler_mut();
+            if !newly_committed.is_empty() {
+                // 기존의 복잡한 block_store 클론 및 명시적 스코프({}) 코드를 모두 제거하고
+                // Core의 헬퍼 메서드 하나로 대체합니다.
+                let (committed_subdag, aggregator_state) =
+                    self.core.process_committed_leaders(newly_committed);
 
-                // 3. C-Path 폴백 실행 (클론된 block_store 사용)
-                let committed_subdag = commit_handler
-                    .handle_commit(&block_store_clone, newly_committed);
-
-                // 4. C-Path 상태 가져오기
-                let aggregator_state = commit_handler.aggregator_state();
-
-                (committed_subdag, aggregator_state)
-            };
-            // 5. 이 지점에서 `commit_handler`의 가변 대여가 해제됩니다.
-
-            // 6. 이제 self.core를 다시 안전하게 가변 대여할 수 있습니다.
-            self.core.handle_committed_subdag(
-                committed_subdag,
-                &aggregator_state,
-            );
+                // 최종 처리 결과(SubDag)를 Core에 반영 (WAL 기록 등)
+                self.core.handle_committed_subdag(
+                    committed_subdag,
+                    &aggregator_state,
+                );
+            }
         }
     }
 
@@ -189,7 +184,7 @@ mod tests {
 
     pub enum SyncerEvent {
         ForceNewBlock(RoundNumber),
-        DeliverBlock(Data<StatementBlock>),
+        DeliverBlock((Data<StatementBlock>, bool)),
     }
 
     // -----------------------------------------------------------------
@@ -229,7 +224,7 @@ mod tests {
                     Scheduler::schedule_event(
                         latency,
                         authority as usize,
-                        SyncerEvent::DeliverBlock(last_block.clone()),
+                        SyncerEvent::DeliverBlock((last_block.clone(), true)),
                     );
                 }
             }

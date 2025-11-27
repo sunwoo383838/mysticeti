@@ -1,10 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 
 use serde::{Deserialize, Serialize};
-
+use mysticeti_core::config::FaultConfig;
 use crate::{protocol::ProtocolParameters, settings::Settings, ClientParameters, NodeParameters};
 
 /// Shortcut avoiding to use the generic version of the benchmark parameters.
@@ -24,6 +25,8 @@ pub struct BenchmarkParametersGeneric<N, C> {
     pub nodes: usize,
     /// The total load (tx/s) to submit to the system.
     pub load: usize,
+    #[serde(default)]
+    pub fault_assignments: HashMap<usize, FaultConfig>,
 }
 
 impl<N: Debug, C: Debug> Debug for BenchmarkParametersGeneric<N, C> {
@@ -67,6 +70,7 @@ impl<N: ProtocolParameters, C: ProtocolParameters> BenchmarkParametersGeneric<N,
                 client_parameters: client_parameters.clone(),
                 nodes,
                 load,
+                fault_assignments: HashMap::new(),
             })
             .collect()
     }
@@ -79,6 +83,7 @@ impl<N: ProtocolParameters, C: ProtocolParameters> BenchmarkParametersGeneric<N,
             client_parameters: C::default(),
             nodes: 4,
             load: 500,
+            fault_assignments: HashMap::new(),
         }
     }
 }

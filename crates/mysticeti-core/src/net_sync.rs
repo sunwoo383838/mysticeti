@@ -72,7 +72,9 @@ pub struct NetworkSyncerInner<H: BlockHandler> {
     dkg_manager: Arc<Mutex<DkgManager>>,
     prepared_verifying_key: PreparedVerifyingKey<Bls12_381>,
     crypto_config: CryptoConfig,
-    nullifier_db: Arc<NullifierDB>
+    nullifier_db: Arc<NullifierDB>,
+    block_level_fpc: bool,
+    metrics: Arc<Metrics>,
 }
 
 impl<H: BlockHandler + 'static> NetworkSyncer<H> {
@@ -118,7 +120,9 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
             dkg_manager,
             prepared_verifying_key,
             crypto_config,
-            nullifier_db
+            nullifier_db,
+            block_level_fpc: public_config.parameters.enable_block_fpc,
+            metrics: metrics.clone(),
         });
         let block_fetcher = Arc::new(BlockFetcher::start(
             authority_index,
@@ -266,21 +270,25 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
                             peer,
                             e
                         );
-                        // Terminate connection upon receiving incorrect block.
                         break;
                     }
 
                     if let Err(e) = Self::verify_block_batch(inner.clone(), block.clone()).await {
-                        tracing::warn!(
+                        if inner.block_level_fpc {
+                            tracing::warn!(
                             "Rejected invalid block content (ZK/Nullifier fail) {} from {}: {:?}",
                             block.reference(),
                             peer,
                             e
-                        );
-                        break;
+                            );
+                            break;
+                        } else {
+                            tracing::debug!("Block {} batch verify failed. Marking for individual verification.", block.reference());
+                            inner.syncer.add_blocks(vec![(block.clone(), true)]).await;
+                        }
                     }
-                    
-                    inner.syncer.add_blocks(vec![block]).await;
+
+                    inner.syncer.add_blocks(vec![(block, false)]).await;
                 }
                 NetworkMessage::RequestBlocks(references) => {
                     if references.len() > MAXIMUM_BLOCK_REQUEST {

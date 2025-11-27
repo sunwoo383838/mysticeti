@@ -67,6 +67,35 @@ pub trait ImportExport: Serialize + DeserializeOwned {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum ByzantineType {
+    /// 1. ZK 증명을 위조하거나 깨진 데이터를 보냄
+    InvalidProof,
+    /// 2. 유효한 트랜잭션을 복제해서 보냄 (Nullifier 중복 공격)
+    DoubleVote,
+}
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")] // 설정 파일에서 type: "crash" 처럼 사용
+pub enum FaultConfig {
+    /// 지정된 시간 후 노드가 비정상 종료됨 (Crash Fault)
+    Crash {
+        #[serde(default)]
+        start_delay: Duration,
+    },
+    /// 지정된 시간 후 악의적인 동작 시작 (Byzantine Fault)
+    Byzantine {
+        #[serde(default)]
+        start_delay: Duration,
+        // 추후 비잔틴 세부 유형(예: Equivocation)을 여기에 추가할 수 있음
+        behavior: ByzantineType,
+    },
+}
+
+impl ImportExport for FaultConfig {}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NodeParameters {
     #[serde(default = "node_defaults::default_wave_length")]
     pub wave_length: RoundNumber,
@@ -86,6 +115,8 @@ pub struct NodeParameters {
     pub consensus_only: bool,
     #[serde(default = "node_defaults::default_enable_synchronizer")]
     pub enable_synchronizer: bool,
+    #[serde(default = "node_defaults::default_enable_block_fpc")]
+    pub enable_block_fpc: bool,
 }
 
 pub mod node_defaults {
@@ -124,6 +155,10 @@ pub mod node_defaults {
     pub fn default_enable_synchronizer() -> bool {
         false
     }
+
+    pub fn default_enable_block_fpc() -> bool {
+        true
+    }
 }
 
 impl Default for NodeParameters {
@@ -138,6 +173,7 @@ impl Default for NodeParameters {
             enable_pipelining: node_defaults::default_enable_pipelining(),
             consensus_only: node_defaults::default_consensus_only(),
             enable_synchronizer: node_defaults::default_enable_synchronizer(),
+            enable_block_fpc: node_defaults::default_enable_block_fpc(),
         }
     }
 }
