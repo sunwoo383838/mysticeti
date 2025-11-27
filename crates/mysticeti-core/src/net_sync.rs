@@ -409,8 +409,8 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
 
     // --- ❗ (신규) Tally 프로토콜 헬퍼 함수 ---
     async fn run_tally_protocol( // ❗ H 제네릭 추가
-        inner: Arc<NetworkSyncerInner<H>>,
-        epoch_close_signal_sender: mpsc::Sender<()>, // ❗ Sender 복제본
+                                 inner: Arc<NetworkSyncerInner<H>>,
+                                 epoch_close_signal_sender: mpsc::Sender<()>, // ❗ Sender 복제본
     ) {
         // 1. Core에 모든 커밋된 트랜잭션 요청
         let all_committed_tx_locators = inner.syncer
@@ -423,9 +423,27 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
         // 3. 동형암호 집계 (HE Aggregation)
         let aggregated_ciphertext = Self::perform_he_aggregation(encrypted_votes).await;
 
-        // 4. Core에서 내 DKG 비밀 키 가져오기
-        let my_share = inner.syncer.get_my_secret_share().await
-            .expect("DKG key is not available for Tally protocol");
+        // 4. [수정됨] Core에서 내 DKG 비밀 키 가져오기 (재시도 로직 적용)
+        // 기존: .expect("...")로 인해 키가 없으면 즉시 패닉 발생
+        // 변경: 키가 생길 때까지 1초 간격으로 대기하며 재시도
+        let mut attempts = 0;
+        let my_share = loop {
+            if let Some(share) = inner.syncer.get_my_secret_share().await {
+                break share;
+            }
+
+            // 10회 이상(약 10초) 대기해도 키가 없으면 포기하고 종료 (선택 사항)
+            if attempts >= 10 {
+                tracing::error!("🚨 [Tally] 10초 대기 후에도 DKG 키를 찾을 수 없습니다. Tally를 건너뜁니다.");
+                // 채널을 닫아 메인 태스크가 종료되도록 함
+                drop(epoch_close_signal_sender);
+                return;
+            }
+
+            tracing::warn!("[Tally] DKG 키 준비 안 됨. 1초 대기... (시도 {}/10)", attempts + 1);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            attempts += 1;
+        };
 
         // 5. 부분 복호화
         let partial_decryption = Self::perform_partial_decryption(&aggregated_ciphertext, &my_share).await;

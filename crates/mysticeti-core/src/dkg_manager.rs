@@ -45,6 +45,7 @@ pub struct DkgManager {
 
     pub final_pk: Option<JubJubAffine>,
     pub final_sk_share: Option<JubJubFr>,
+    pending_shares: HashMap<AuthorityIndex, Share>,
 
     // 네트워크
     network_senders: HashMap<AuthorityIndex, mpsc::Sender<NetworkMessage>>,
@@ -72,6 +73,7 @@ impl DkgManager {
             final_sk_share: None,
             network_senders: HashMap::new(),
             global_seed: crypto_config.global_seed,
+            pending_shares: HashMap::new(), // [초기화]
         }
     }
 
@@ -132,27 +134,38 @@ impl DkgManager {
 
         if let DkgState::AwaitingCommitments(ref mut received_commits) = &mut self.state {
             if received_commits.insert(sender_auth, commits).is_some() {
-                tracing::warn!("[DKG] {sender_auth}번 피어로부터 중복된 커밋 수신");
+                // 중복 처리
                 return;
             }
 
             if received_commits.len() == self.n {
-                tracing::info!("[DKG] 1단계 완료: 모든 피어({}명)로부터 커밋 수신. 2단계(셰어 전송) 시작.", self.n);
+                tracing::info!("[DKG] 1단계 완료. 2단계(셰어 전송) 시작.");
 
+                // 1. 셰어 전송 (기존 코드)
                 let shares_to_send = self.my_shares_to_send.clone();
                 let network_senders = self.network_senders.clone();
                 let my_index = self.my_index;
-                let self_sender = self.network_senders.get(&self.my_index).cloned(); // 자신에게 보낼 Sender (없어도 됨)
-
                 tokio::spawn(async move {
-                    Self::send_shares(shares_to_send, network_senders, my_index, self_sender).await;
+                    Self::send_shares(shares_to_send, network_senders, my_index, None).await;
                 });
 
-                self.state = DkgState::AwaitingShares(std::mem::take(received_commits), HashMap::new());
+                // 2. 상태 변경 (AwaitingShares로 전이)
+                // 여기서 `std::mem::take`를 사용해 커밋 맵을 가져옴
+                let all_commits = std::mem::take(received_commits);
+                self.state = DkgState::AwaitingShares(all_commits, HashMap::new());
 
+                // 3. [핵심 수정] 자신의 셰어 처리
                 let my_share = self.my_shares_to_send[self.my_index as usize].clone();
-                assert_eq!(my_share.index, self.my_index + 1); // 인덱스 검증 (1-based)
                 self.handle_share(self.my_index, my_share);
+
+                // 4. [핵심 수정] 버퍼링된(미리 도착한) 셰어들 재처리 (Replay)
+                let pending: Vec<_> = self.pending_shares.drain().collect();
+                if !pending.is_empty() {
+                    tracing::info!("[DKG] 버퍼링된 {}개의 셰어를 재처리합니다.", pending.len());
+                    for (sender, share) in pending {
+                        self.handle_share(sender, share);
+                    }
+                }
             }
         }
     }
@@ -186,64 +199,51 @@ impl DkgManager {
 
     /// 3. `NetworkSyncer`가 DkgShare 메시지를 수신했을 때 호출
     pub fn handle_share(&mut self, sender_auth: AuthorityIndex, share: Share) {
-        let current_state_str = format!("{:?}", self.state);
+        // 현재 상태 확인
+        match &mut self.state {
+            // 1. 정상 상태: 셰어를 기다리는 중
+            DkgState::AwaitingShares(all_commits, received_shares) => {
+                // --- 기존 검증 및 저장 로직 ---
+                if share.index != self.my_index + 1 {
+                    tracing::warn!("[DKG] 잘못된 인덱스 셰어 무시");
+                    return;
+                }
 
-        let (all_commits, mut received_shares) = match std::mem::replace(&mut self.state, DkgState::Idle) {
-            DkgState::AwaitingShares(commits, shares) => (commits, shares),
-            other => {
-                // 🔥 중요: 상태 복원
-                self.state = other;
-                tracing::warn!(
-                "[DKG] {sender_auth}번 피어로부터 셰어를 받았으나, 현재 상태가 AwaitingShares가 아님 (현재: {current_state_str})"
-            );
-                return;
+                let sender_commits = if let Some(c) = all_commits.get(&sender_auth) {
+                    c
+                } else {
+                    tracing::error!("[DKG] {}번 피어의 커밋을 찾을 수 없음 (치명적 오류)", sender_auth);
+                    return;
+                };
+
+                if !verify_share_with_commitments(&share, sender_commits, self.g) {
+                    tracing::warn!("[DKG] VSS 검증 실패 from {}", sender_auth);
+                    return;
+                }
+
+                if received_shares.insert(sender_auth, share).is_some() {
+                    return; // 중복
+                }
+
+                // 모든 셰어 수집 완료 확인
+                if received_shares.len() == self.n {
+                    // 여기서 self를 mut로 빌려야 하므로, 데이터를 복제하여 함수 호출
+                    let commits_clone = all_commits.clone();
+                    let shares_clone = received_shares.clone();
+                    self.aggregate_keys(&commits_clone, &shares_clone);
+                }
             }
-        };
 
-        // --- 여기서부터는 self가 빌려지지 않은 상태입니다 ---
+            // 2. 아직 준비 안 된 상태: 메시지 버퍼링
+            DkgState::Idle | DkgState::AwaitingCommitments(_) => {
+                tracing::info!("[DKG] 아직 셰어 수신 단계가 아님. {}번 피어의 셰어를 버퍼링합니다.", sender_auth);
+                self.pending_shares.insert(sender_auth, share);
+            }
 
-        // 2. 이 셰어가 나를 위한 셰어가 맞는지 확인 (share.index는 1-based)
-        if share.index != self.my_index + 1 {
-            tracing::warn!("[DKG] {sender_auth}번 피어로부터 잘못된 인덱스({})의 셰어 수신 (내 인덱스: {})", share.index, self.my_index + 1);
-
-            // [수정] 처리 실패 시, 원래 상태로 되돌립니다.
-            self.state = DkgState::AwaitingShares(all_commits, received_shares);
-            return;
-        }
-
-        tracing::info!("[DKG] {sender_auth}번 피어로부터 셰어 수신 (검증 시작...)");
-
-        // 3. VSS 검증
-        let sender_commits = all_commits.get(&sender_auth).expect("커밋 맵에 발신자가 없음");
-
-        if !verify_share_with_commitments(&share, sender_commits, self.g) {
-            tracing::warn!("[DKG] *** VSS 검증 실패! *** {sender_auth}번 피어가 잘못된 셰어를 보냄.");
-
-            // [수정] 처리 실패 시, 원래 상태로 되돌립니다.
-            self.state = DkgState::AwaitingShares(all_commits, received_shares);
-            return;
-        }
-
-        // 4. 검증된 셰어 저장
-        if received_shares.insert(sender_auth, share).is_some() {
-            tracing::warn!("[DKG] {sender_auth}번 피어로부터 중복된 셰어 수신");
-
-            // [수정] 중복이지만 상태는 되돌려야 합니다.
-            self.state = DkgState::AwaitingShares(all_commits, received_shares);
-            return;
-        }
-
-        // 5. 모든 피어(n명)로부터 셰어를 수신했는지 확인
-        if received_shares.len() == self.n {
-            tracing::info!("[DKG] 2단계 완료: 모든 피어({}명)로부터 셰어 수신 및 검증 완료. 3단계(키 집계) 시작.", self.n);
-
-            // [수정] 이제 self가 빌려지지 않았으므로 aggregate_keys 호출이 안전합니다.
-            // aggregate_keys는 내부에서 self.state를 DkgState::Complete로 변경할 것입니다.
-            self.aggregate_keys(&all_commits, &received_shares);
-
-        } else {
-            // [수정] 아직 모든 셰어를 받지 못했으므로, 상태를 다시 AwaitingShares로 되돌립니다.
-            self.state = DkgState::AwaitingShares(all_commits, received_shares);
+            // 3. 이미 완료된 상태
+            DkgState::Complete | DkgState::AwaitingPartialDecryptions(_, _) => {
+                tracing::debug!("[DKG] 이미 완료된 상태에서 셰어 수신. 무시.");
+            }
         }
     }
 

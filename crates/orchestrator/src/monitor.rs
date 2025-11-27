@@ -326,7 +326,7 @@ impl NodeExporter {
         );
 
         [
-            "(sudo systemctl status node_exporter && exit 0)",
+            "(sudo systemctl is-active --quiet node_exporter && exit 0) || true",
             &format!("curl -LO {source}"),
             &format!(
                 // [수정 2] amd64 -> arm64

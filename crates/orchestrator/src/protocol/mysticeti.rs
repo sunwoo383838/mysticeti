@@ -175,7 +175,7 @@ impl ProtocolCommands for MysticetiProtocol {
                 };
 
                 let run = [
-                    "RUST_LOG=info,mysticeti_core=debug,mysticeti=debug",
+                    "RUST_LOG=info RUST_BACKTRACE=1",
                     &format!("./{BINARY_PATH}/mysticeti"),
                     "run",
                     &format!("--authority {authority}"),
