@@ -336,8 +336,8 @@ impl Metrics {
             ).unwrap(),
 
             latency_breakdown_5_commit: register_histogram_vec_with_registry!(
-                "latency_breakdown_4_cert",
-                "Time from Block creation to L1 Certification (2f+1 votes)",
+                "latency_breakdown_5_commit", // ✅ 수정됨
+                "Time from Block creation to Commit", // (선택사항) 설명도 "Commit"으로 수정하면 좋습니다
                 &["workload"],
                 LATENCY_SEC_BUCKETS.to_vec(),
                 registry,
