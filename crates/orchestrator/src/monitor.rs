@@ -318,7 +318,8 @@ impl NodeExporter {
     const SERVICE_PATH: &'static str = "/etc/systemd/system/node_exporter.service";
 
     pub fn install_commands() -> Vec<String> {
-        let build = format!("node_exporter-{}.linux-amd64", Self::RELEASE);
+        // [수정 1] amd64 -> arm64
+        let build = format!("node_exporter-{}.linux-arm64", Self::RELEASE);
         let source = format!(
             "https://github.com/prometheus/node_exporter/releases/download/v{}/{build}.tar.gz",
             Self::RELEASE
@@ -328,13 +329,16 @@ impl NodeExporter {
             "(sudo systemctl status node_exporter && exit 0)",
             &format!("curl -LO {source}"),
             &format!(
-                "tar -xvf node_exporter-{}.linux-amd64.tar.gz",
+                // [수정 2] amd64 -> arm64
+                "tar -xvf node_exporter-{}.linux-arm64.tar.gz",
                 Self::RELEASE
             ),
             &format!(
-                "sudo mv node_exporter-{}.linux-amd64/node_exporter /usr/local/bin/",
+                // [수정 3] amd64 -> arm64
+                "sudo mv node_exporter-{}.linux-arm64/node_exporter /usr/local/bin/",
                 Self::RELEASE
             ),
+            // (이전에 수정한 사용자 생성 로직 유지)
             "id -u node_exporter >/dev/null 2>&1 || sudo useradd -rs /bin/false node_exporter",
             "sudo chmod 777 -R /etc/systemd/system/",
             &format!(
@@ -346,8 +350,8 @@ impl NodeExporter {
             "sudo systemctl start node_exporter",
             "sudo systemctl enable node_exporter",
         ]
-        .map(|x| x.to_string())
-        .to_vec()
+            .map(|x| x.to_string())
+            .to_vec()
     }
 
     fn service_config() -> String {
