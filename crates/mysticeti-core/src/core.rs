@@ -424,14 +424,11 @@ impl<H: BlockHandler> Core<H> {
     }
 
     pub fn try_commit(&mut self) -> Vec<Data<StatementBlock>> {
-        // 1. UniversalCommitter로 커밋할 리더들 선출 (순수 CPU 연산)
-        let committed_leaders = self.committer.try_commit(self.last_commit_leader);
-        if committed_leaders.is_empty() {
-            return vec![];
-        }
+        // 1. 커밋할 리더 결정
+        let committed_blocks = self.committer.try_commit(self.last_commit_leader);
 
         // LeaderStatus -> Block 변환
-        let committed_leaders: Vec<_> = committed_leaders
+        let committed_leaders: Vec<_> = committed_blocks
             .into_iter()
             .filter_map(|leader| leader.into_decided_block())
             .collect();
@@ -440,47 +437,42 @@ impl<H: BlockHandler> Core<H> {
             self.last_commit_leader = *last.reference();
         }
 
-        // Epoch 관리
         if self.last_commit_leader.round() > self.rounds_in_epoch {
             self.epoch_manager.epoch_change_begun();
         }
 
-        // 2. Linearization 수행 (CPU 연산)
-        // 기존에 Syncer가 호출하던 process_committed_leaders 로직을 여기로 가져옴
-        // Core가 Linearizer를 소유하고 있으므로 가능
-        let committed_subdags = self.linearizer.handle_commit(&self.block_store, committed_leaders.clone());
-
-        // 3. Epoch Manager 업데이트 (메모리 연산)
-        for sub_dag in &committed_subdags {
-            for block in &sub_dag.blocks {
-                self.epoch_manager
-                    .observe_committed_block(block, &self.committee);
-            }
-        }
-
-        // 4. WAL 기록 (동기 I/O - 하지만 빠름)
-        // 커밋 사실 자체는 Core의 상태이므로 Core가 기록해야 재시작 시 복구 가능
-        // FPC 상태 등 무거운 데이터는 제외하고 최소한의 커밋 정보만 기록
-        let state = Bytes::new(); // Linearizer 상태는 재계산 가능하거나 별도 관리
-        self.write_commits_data(&committed_subdags, &state);
-
+        // 커밋된 리더 이력 저장 (테스트용)
         for block in &committed_leaders {
             self.committed_leaders.push(*block.reference());
         }
 
-        // 5. 🚀 [핵심] 무거운 DB I/O 작업을 FpcService로 위임 (비동기)
-        // 기존 handle_committed_subdag 내부의 DB 쓰기 로직을 대체
-        if !committed_subdags.is_empty() {
-            // C-Path로 확정된 블록들을 FPC 워커에게 던져서
-            // "이거 확정됐으니 NullifierDB에 쓰고 마무리해" 라고 지시
-            let msg = FpcMessage::CommittedLeaders(
-                committed_subdags.iter().flat_map(|sub_dag| sub_dag.blocks.clone()).collect()
-            );
+        // 2. Linearization 수행 (Core 상태 업데이트용)
+        let committed_subdags = self.linearizer.handle_commit(&self.block_store, committed_leaders.clone());
+
+        // 3. Epoch Manager 업데이트
+        for sub_dag in &committed_subdags {
+            for block in &sub_dag.blocks {
+                self.epoch_manager.observe_committed_block(block, &self.committee);
+            }
+        }
+
+        // 4. WAL 기록
+        let state = Bytes::new();
+        self.write_commits_data(&committed_subdags, &state);
+
+        // 5. 🚀 [수정됨] FPC Service로 "진짜 리더 목록"만 전송
+        if !committed_leaders.is_empty() {
+            // ❌ 이전 코드 (버그): SubDag 전체를 보냄 -> 중복 커밋 발생
+            // let msg = FpcMessage::CommittedLeaders(
+            //    committed_subdags.iter().flat_map(|sub_dag| sub_dag.blocks.clone()).collect()
+            // );
+
+            // ✅ 수정된 코드 (정답): 선출된 리더(committed_leaders)만 보냄
+            // CommitHandler가 내부적으로 다시 Linearizer를 돌려 안전하게 저장함
+            let msg = FpcMessage::CommittedLeaders(committed_leaders.clone());
 
             if let Err(e) = self.fpc_sender.try_send(msg) {
                 tracing::error!("Failed to send committed leaders to FPC service: {:?}", e);
-                // 채널이 가득 차면 DB 저장이 지연될 수 있으나, Core는 멈추지 않음.
-                // (Liveness > Persistence Priority)
             }
         }
 
