@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::{block_handler, block_handler::{RealBlockHandler, CommitHandler}, block_store::BlockStore, committee::Committee, config::{ClientParameters, NodePrivateConfig, NodePublicConfig}, core::{Core, CoreOptions}, log::TransactionLog, metrics::Metrics, net_sync::NetworkSyncer, network::Network, prometheus, runtime::{JoinError, JoinHandle}, transactions_generator::TransactionGenerator, types::AuthorityIndex, wal::{self, walf}};
 use crate::config::{CryptoConfig, FaultConfig};
 use crate::dkg_manager::DkgManager;
+use crate::fpc_service::FpcService;
 use crate::mempool::Mempool;
 use crate::nullifier::NullifierDB;
 
@@ -94,6 +95,7 @@ impl Validator {
         let committed_transaction_log =
             TransactionLog::start(private_config.committed_transactions_log())
                 .expect("Failed to open committed transaction log for write");
+
         let commit_handler = CommitHandler::new(
             committee.clone(),
             block_handler.transaction_time.clone(),
@@ -101,6 +103,17 @@ impl Validator {
             nullifier_db.clone(),
             committed_transaction_log,
             &public_config,
+        );
+
+        let block_store_for_fpc = recovered.block_store.clone();
+
+        let (fpc_sender, _fpc_handle) = FpcService::spawn(
+            Arc::new(block_store_for_fpc),
+            committee.clone(),
+            commit_handler, // ✅ 소유권 이동
+            metrics.clone(),
+            block_handler.transaction_time.clone(),
+            public_config.parameters.enable_block_fpc,
         );
 
         let dkg_complete_notify = Arc::new(Notify::new());
@@ -122,7 +135,7 @@ impl Validator {
             recovered,
             wal_writer,
             CoreOptions::default(),
-            commit_handler,
+            fpc_sender,
             dkg_manager.clone(), // ❗ 전달
             dkg_complete_notify.clone(), // ❗ 전달
             my_secret_share.clone(), // ❗ 전달

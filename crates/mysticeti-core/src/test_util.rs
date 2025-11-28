@@ -35,7 +35,9 @@ use crate::{
     types::{format_authority_index, AuthorityIndex, BlockReference, RoundNumber, StatementBlock},
     wal::{open_file_for_wal, walf, WalPosition, WalWriter},
 };
-use tokio::sync::{Mutex, Notify}; // ❗ 추가
+use tokio::sync::{Mutex, Notify};
+use crate::fpc_service::FpcService;
+// ❗ 추가
 
 pub fn test_metrics() -> Arc<Metrics> {
     Metrics::new(&Registry::new(), None).0
@@ -133,6 +135,17 @@ pub fn committee_and_cores_persisted_epoch_duration(
                 &public_config,
             );
 
+            let block_store_for_fpc = recovered.block_store.clone();
+
+            let (fpc_sender, _fpc_handle) = FpcService::spawn(
+                Arc::new(block_store_for_fpc),
+                committee.clone(),
+                commit_handler, // ✅ 소유권 이동
+                metrics.clone(),
+                block_handler.transaction_time.clone(),
+                public_config.parameters.enable_block_fpc,
+            );
+
             let dkg_complete_notify = Arc::new(Notify::new());
             let my_secret_share = Arc::new(Mutex::new(Option::<Fr>::None));
             let dkg_manager = Arc::new(Mutex::new(DkgManager::new(
@@ -154,7 +167,7 @@ pub fn committee_and_cores_persisted_epoch_duration(
                 recovered,
                 wal_writer,
                 CoreOptions::test(),
-                commit_handler, // ❗ CommitHandler 인자 전달
+                fpc_sender,     // ✅ 추가됨 (FPC/DB 워커 채널)
                 dkg_manager.clone(),
                 dkg_complete_notify.clone(),
                 my_secret_share.clone(),
@@ -333,7 +346,7 @@ pub fn check_commits<H: BlockHandler, S: SyncerSignals>(
     let commits = syncers
         .iter()
         // ❗ syncer.rs 수정 시 `commit_observer()`가 &CommitHandler를 반환하도록 수정 필요
-        .map(|state| state.commit_observer().committed_leaders());
+        .map(|state| state.core().committed_leaders());
     let zero_commit = vec![];
     let mut max_commit = &zero_commit;
     for commit in commits {

@@ -8,7 +8,7 @@ use std::{
 };
 use std::collections::HashMap;
 use ark_ed_on_bls12_381::Fr;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use minibytes::Bytes;
 
 use crate::{
@@ -41,8 +41,10 @@ use crate::{
 };
 use crate::block_handler::CommitHandler;
 use crate::committee::{QuorumThreshold, StakeAggregator};
+use crate::consensus::linearizer::Linearizer;
 use crate::dkg_manager::DkgManager;
 use crate::finalization_interpreter::FinalizationInterpreter;
+use crate::fpc_service::FpcMessage;
 use crate::syncer::CommitObserver;
 use crate::types::TransactionLocator;
 
@@ -61,21 +63,16 @@ pub struct Core<H: BlockHandler> {
     options: CoreOptions,
     signer: Signer,
     // todo - ugly, probably need to merge syncer and core
-    recovered_committed_blocks: Option<(HashSet<BlockReference>, Option<Bytes>)>,
     epoch_manager: EpochManager,
     rounds_in_epoch: RoundNumber,
     committer: UniversalCommitter,
-    commit_handler: CommitHandler,
-    fpc_transaction_aggregator:
-        HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
-    fpc_certificate_aggregator:
-        HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>,
-    fpc_block_aggregator: HashMap<BlockReference, HashMap<BlockReference, StakeAggregator<QuorumThreshold>>>,
-    fpc_block_certificate_aggregator: HashMap<BlockReference, StakeAggregator<QuorumThreshold>>,
+    fpc_sender: mpsc::Sender<FpcMessage>,
+    linearizer: Linearizer,
     enable_block_fpc: bool,
     dkg_manager: Arc<Mutex<DkgManager>>,
     dkg_complete_notify: Arc<Notify>,
     my_secret_share: Arc<Mutex<Option<Fr>>>,
+    committed_leaders: Vec<BlockReference>,
 }
 
 pub struct CoreOptions {
@@ -100,7 +97,7 @@ impl<H: BlockHandler> Core<H> {
         recovered: RecoveredState,
         mut wal_writer: WalWriter,
         options: CoreOptions,
-        commit_handler: CommitHandler,
+        fpc_sender: mpsc::Sender<FpcMessage>,
         dkg_manager: Arc<Mutex<DkgManager>>,
         dkg_complete_notify: Arc<Notify>,
         my_secret_share: Arc<Mutex<Option<Fr>>>,
@@ -113,7 +110,7 @@ impl<H: BlockHandler> Core<H> {
             unprocessed_blocks,
             last_committed_leader,
             committed_blocks,
-            committed_state,
+            committed_state: _,
         } = recovered;
         let mut threshold_clock = ThresholdClockAggregator::new(0);
         let last_own_block = if let Some(own_block) = last_own_block {
@@ -152,6 +149,8 @@ impl<H: BlockHandler> Core<H> {
         }
 
         let epoch_manager = EpochManager::new();
+        let mut linearizer = Linearizer::new();
+        linearizer.committed = committed_blocks;
 
         let committer =
             UniversalCommitterBuilder::new(committee.clone(), block_store.clone(), metrics.clone())
@@ -181,44 +180,24 @@ impl<H: BlockHandler> Core<H> {
             metrics,
             options,
             signer: private_config.keypair,
-            recovered_committed_blocks: Some((committed_blocks, committed_state)),
             epoch_manager,
             rounds_in_epoch: public_config.parameters.rounds_in_epoch,
             committer,
-            commit_handler,
-            fpc_transaction_aggregator: Default::default(),
-            fpc_certificate_aggregator: Default::default(),
-            fpc_block_aggregator: Default::default(),
-            fpc_block_certificate_aggregator: Default::default(),
+            fpc_sender,
+            linearizer,
             enable_block_fpc: public_config.parameters.enable_block_fpc,
             dkg_manager,
             dkg_complete_notify,
             my_secret_share,
+            committed_leaders: vec![],
         };
 
-        let transaction_time = this.block_handler.transaction_time();
-        let metrics = this.metrics.clone();
-
         if !unprocessed_blocks.is_empty() {
-            tracing::info!(
-                "Replaying {} blocks for transaction aggregator",
-                unprocessed_blocks.len()
-            );
-
+            tracing::info!("Replaying {} blocks (sending to FPC service)", unprocessed_blocks.len());
             for block in &unprocessed_blocks {
-                let mut fpc = FinalizationInterpreter::new(
-                    &this.block_store,
-                    this.committee.clone(),
-                    &mut this.commit_handler,
-                    &mut this.fpc_transaction_aggregator,
-                    &mut this.fpc_certificate_aggregator,
-                    &mut this.fpc_block_aggregator,
-                    &mut this.fpc_block_certificate_aggregator,
-                    public_config.parameters.enable_block_fpc,
-                    metrics.clone(),
-                    transaction_time.clone(),
-                );
-                fpc.process_block(block);
+                if let Err(e) = this.fpc_sender.try_send(FpcMessage::ProcessBlock(block.clone())) {
+                    tracing::warn!("Failed to replay block to FPC service: {:?}", e);
+                }
             }
             let blocks_to_replay: Vec<_> = unprocessed_blocks.iter().map(|b| (b.clone(), true)).collect();
             this.run_block_handler(&blocks_to_replay);
@@ -242,8 +221,8 @@ impl<H: BlockHandler> Core<H> {
             .utilization_timer
             .utilization_timer("Core::add_blocks");
 
-        // 1. BlockManager에 (Block, bool) 전달
-        // 주의: BlockManager::add_blocks도 (WalPosition, Data<StatementBlock>, bool)을 반환하도록 수정되어야 함
+        // 1. BlockManager를 통해 블록 저장 (WAL 쓰기 - 동기식, 여기서 약간의 지연 발생 가능)
+        //    하지만 5000 TPS 상황에서도 단순 파일 쓰기는 FPC 로직보다는 훨씬 빠름.
         let processed = self
             .block_manager
             .add_blocks(blocks, &mut (&mut self.wal_writer, &self.block_store));
@@ -251,76 +230,32 @@ impl<H: BlockHandler> Core<H> {
         let mut result_blocks = Vec::with_capacity(processed.len());
         let mut blocks_for_handler = Vec::with_capacity(processed.len());
 
-        // 2. 처리된 블록 순회
-        // processed: Vec<(WalPosition, Data<StatementBlock>, bool)>
         for (position, block, check_individual) in processed.into_iter() {
             // Threshold Clock 업데이트
             self.threshold_clock
                 .add_block(*block.reference(), &self.committee);
-
-            // Pending 목록에 추가 (복구용)
             self.pending
                 .push_back((position, MetaStatement::Include(*block.reference())));
 
-            let transaction_time = self.block_handler.transaction_time();
-            let metrics = self.metrics.clone();
+            if let Err(e) = self.fpc_sender.try_send(FpcMessage::ProcessBlock(block.clone())) {
+                tracing::warn!("FPC channel full, dropping block from FPC: {:?}", block.reference());
+            }
 
-            // FPC Interpreter 처리 (투표 집계)
-            // 사용자 요구사항: 검증은 여기서 하지 않고, 집계만 수행 (혹은 BlockHandler의 Reject 투표에 의존)
-            let mut interpreter = FinalizationInterpreter::new(
-                &self.block_store,
-                self.committee.clone(),
-                &mut self.commit_handler,
-                &mut self.fpc_transaction_aggregator,
-                &mut self.fpc_certificate_aggregator,
-                &mut self.fpc_block_aggregator,
-                &mut self.fpc_block_certificate_aggregator,
-                self.enable_block_fpc,
-                metrics.clone(),
-                transaction_time.clone(),
-            );
-            interpreter.process_block(&block);
-
-            // 결과 목록 구성
             result_blocks.push(block.clone());
 
-            // BlockHandler에게 넘길 튜플 구성
             blocks_for_handler.push((block, check_individual));
         }
 
-        // 3. BlockHandler 호출 (수정된 시그니처 사용)
         self.run_block_handler(&blocks_for_handler);
         result_blocks
     }
 
-
-
-    pub fn process_committed_leaders(
-        &mut self,
-        committed_leaders: Vec<Data<StatementBlock>>,
-    ) -> (Vec<CommittedSubDag>, Bytes) {
-
-        let sub_dag = self.commit_handler.handle_commit(
-            &self.block_store,
-            committed_leaders,
-            &self.fpc_transaction_aggregator, // 🌟 여기서 안전하게 전달 가능
-        );
-
-        let state = self.commit_handler.aggregator_state();
-
-        (sub_dag, state)
-    }
-
-    pub fn commit_handler_mut(&mut self) -> &mut CommitHandler {
-        &mut self.commit_handler
-    }
-
-    pub fn commit_handler(&self) -> &CommitHandler {
-        &self.commit_handler
-    }
-
     pub fn epoch_manager_mut(&mut self) -> &mut EpochManager {
         &mut self.epoch_manager
+    }
+
+    pub fn committed_leaders(&self) -> &Vec<BlockReference> {
+        &self.committed_leaders
     }
 
     // ❗ 2. Tally 프로토콜을 위해 DKG 키에 접근
@@ -489,23 +424,92 @@ impl<H: BlockHandler> Core<H> {
     }
 
     pub fn try_commit(&mut self) -> Vec<Data<StatementBlock>> {
-        let sequence: Vec<_> = self
-            .committer
-            .try_commit(self.last_commit_leader)
+        // 1. UniversalCommitter로 커밋할 리더들 선출 (순수 CPU 연산)
+        let committed_leaders = self.committer.try_commit(self.last_commit_leader);
+        if committed_leaders.is_empty() {
+            return vec![];
+        }
+
+        // LeaderStatus -> Block 변환
+        let committed_leaders: Vec<_> = committed_leaders
             .into_iter()
             .filter_map(|leader| leader.into_decided_block())
             .collect();
 
-        if let Some(last) = sequence.last() {
+        if let Some(last) = committed_leaders.last() {
             self.last_commit_leader = *last.reference();
         }
 
-        // todo: should ideally come from execution result of epoch smart contract
+        // Epoch 관리
         if self.last_commit_leader.round() > self.rounds_in_epoch {
             self.epoch_manager.epoch_change_begun();
         }
 
-        sequence
+        // 2. Linearization 수행 (CPU 연산)
+        // 기존에 Syncer가 호출하던 process_committed_leaders 로직을 여기로 가져옴
+        // Core가 Linearizer를 소유하고 있으므로 가능
+        let committed_subdags = self.linearizer.handle_commit(&self.block_store, committed_leaders.clone());
+
+        // 3. Epoch Manager 업데이트 (메모리 연산)
+        for sub_dag in &committed_subdags {
+            for block in &sub_dag.blocks {
+                self.epoch_manager
+                    .observe_committed_block(block, &self.committee);
+            }
+        }
+
+        // 4. WAL 기록 (동기 I/O - 하지만 빠름)
+        // 커밋 사실 자체는 Core의 상태이므로 Core가 기록해야 재시작 시 복구 가능
+        // FPC 상태 등 무거운 데이터는 제외하고 최소한의 커밋 정보만 기록
+        let state = Bytes::new(); // Linearizer 상태는 재계산 가능하거나 별도 관리
+        self.write_commits_data(&committed_subdags, &state);
+
+        for block in &committed_leaders {
+            self.committed_leaders.push(*block.reference());
+        }
+
+        // 5. 🚀 [핵심] 무거운 DB I/O 작업을 FpcService로 위임 (비동기)
+        // 기존 handle_committed_subdag 내부의 DB 쓰기 로직을 대체
+        if !committed_subdags.is_empty() {
+            // C-Path로 확정된 블록들을 FPC 워커에게 던져서
+            // "이거 확정됐으니 NullifierDB에 쓰고 마무리해" 라고 지시
+            let msg = FpcMessage::CommittedLeaders(
+                committed_subdags.iter().flat_map(|sub_dag| sub_dag.blocks.clone()).collect()
+            );
+
+            if let Err(e) = self.fpc_sender.try_send(msg) {
+                tracing::error!("Failed to send committed leaders to FPC service: {:?}", e);
+                // 채널이 가득 차면 DB 저장이 지연될 수 있으나, Core는 멈추지 않음.
+                // (Liveness > Persistence Priority)
+            }
+        }
+
+        committed_leaders
+    }
+
+    pub fn get_all_committed_tx_locators(&self) -> Vec<TransactionLocator> {
+        let (tx, rx) = oneshot::channel();
+        let msg = FpcMessage::GetLocators(tx);
+
+        // CoreThread는 동기 스레드이므로 blocking_send 사용
+        if let Err(e) = self.fpc_sender.blocking_send(msg) {
+            tracing::error!("Failed to send GetLocators request to FpcService: {:?}", e);
+            return vec![];
+        }
+
+        // 응답 대기
+        rx.blocking_recv().unwrap_or_else(|e| {
+            tracing::error!("Failed to receive GetLocators response: {:?}", e);
+            vec![]
+        })
+    }
+
+    fn write_commits_data(&mut self, sub_dags: &[CommittedSubDag], state: &Bytes) {
+        let commit_data: Vec<CommitData> = sub_dags.iter().map(CommitData::from).collect();
+        let commits = bincode::serialize(&(commit_data, state)).expect("Commits serialization failed");
+        self.wal_writer
+            .write(WAL_ENTRY_COMMIT, &commits)
+            .expect("Write to wal has failed");
     }
 
     pub fn cleanup(&self) {

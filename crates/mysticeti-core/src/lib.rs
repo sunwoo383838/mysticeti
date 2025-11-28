@@ -47,3 +47,4 @@ mod wal;
 mod mempool;
 mod nullifier;
 mod dkg_manager;
+mod fpc_service;

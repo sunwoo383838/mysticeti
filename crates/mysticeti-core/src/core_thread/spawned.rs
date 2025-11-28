@@ -190,8 +190,7 @@ impl<H: BlockHandler, S: SyncerSignals> CoreThread<H, S> {
                     sender.send(()).ok();
                 }
                 CoreThreadCommand::GetAllCommittedTxLocators(sender) => {
-                    // ❗ `Core`의 `commit_handler()` getter (1단계에서 추가) 호출
-                    let locators = self.syncer.core().commit_handler().get_all_finalized_locators(); // ❗ 이 함수는 CommitHandler에 구현 필요
+                    let locators = self.syncer.core().get_all_committed_tx_locators();
                     sender.send(locators).ok();
                 }
                 CoreThreadCommand::GetTransactions(locators, sender) => {

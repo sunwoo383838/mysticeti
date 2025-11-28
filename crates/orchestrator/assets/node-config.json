@@ -2,5 +2,5 @@
   "consensus_only": false,
   "benchmark_transaction_size": 512,
   "disable_pipeline": false,
-  "number_of_leaders": 1
+  "number_of_leaders": 2
 }

@@ -16,7 +16,7 @@ from itertools import cycle
 # the following dependencies: `pip install matplotlib`.
 
 # Constants for data filtering
-WARM_UP_THRESHOLD = 40
+WARM_UP_THRESHOLD = 240
 COOL_DOWN_THRESHOLD = 3
 
 def get_valid_data_window(data_points):
@@ -220,42 +220,61 @@ def aggregate_breakdown_components(measurement, workload):
     """
     Returns a dict of average latencies for each component.
     """
+    # 1. Workload 찾기
+    target_workload = workload
     if workload not in measurement['data']:
-        return {}
+        keys = list(measurement['data'].keys())
+        if keys:
+            target_workload = keys[0]
+        else:
+            return {}
 
-    # 누적 합계를 저장할 변수
+    data_source = measurement['data'][target_workload]
+    iterator = data_source.values() if isinstance(data_source, dict) else data_source
+
     sums = {
         'queue': 0.0, 'verify': 0.0, 'pre_con': 0.0, 'cert': 0.0,
         'commit_fpc': 0.0, 'commit_c': 0.0, 'count': 0.0
     }
 
-    # Use valid data window
-    valid_nodes = 0
-    for data in measurement['data'][workload].values():
-        start, end = get_valid_data_window(data)
-        if not (start and end): continue
+    # [변경] 안정화 구간 240초로 설정
+    ramp_up_threshold = 240
 
-        count = float(end['count']) - float(start['count'])
+    for data in iterator:
+        start_snapshot = None
+        for point in data:
+            if float(point['timestamp']['secs']) > ramp_up_threshold:
+                start_snapshot = point
+                break
+
+        if not start_snapshot:
+            continue
+
+        end_snapshot = data[-1]
+
+        count = float(end_snapshot['count']) - float(start_snapshot['count'])
         if count <= 0: continue
 
         sums['count'] += count
-        sums['queue'] += float(end.get('breakdown_queue_sum', 0)) - float(start.get('breakdown_queue_sum', 0))
-        sums['verify'] += float(end.get('breakdown_verify_sum', 0)) - float(start.get('breakdown_verify_sum', 0))
-        sums['pre_con'] += float(end.get('breakdown_pre_consensus_sum', 0)) - float(start.get('breakdown_pre_consensus_sum', 0))
-        sums['cert'] += float(end.get('breakdown_cert_sum', 0)) - float(start.get('breakdown_cert_sum', 0))
-        sums['commit_fpc'] += float(end.get('breakdown_commit_fpc_sum', 0)) - float(start.get('breakdown_commit_fpc_sum', 0))
-        sums['commit_c'] += float(end.get('breakdown_commit_c_sum', 0)) - float(start.get('breakdown_commit_c_sum', 0))
-        valid_nodes += 1
+
+        key_map = {
+            'queue': 'breakdown_queue_sum',
+            'verify': 'breakdown_verify_sum',
+            'pre_con': 'breakdown_pre_consensus_sum',
+            'cert': 'breakdown_cert_sum',
+            'commit_fpc': 'breakdown_commit_fpc_sum',
+            'commit_c': 'breakdown_commit_c_sum'
+        }
+
+        for dict_key, json_key in key_map.items():
+            val_end = float(end_snapshot.get(json_key, 0))
+            val_start = float(start_snapshot.get(json_key, 0))
+            sums[dict_key] += (val_end - val_start)
 
     if sums['count'] == 0:
         return {}
 
-    # 전체 평균 계산 (Total Sum / Total Count)
     avgs = {k: v / sums['count'] for k, v in sums.items() if k != 'count'}
-
-    # Batching 시간 계산 (PreConsensus - (Queue + Verify))
-    # 만약 음수가 나오면 0으로 보정
-    avgs['batching'] = max(0, avgs['pre_con'] - (avgs['queue'] + avgs['verify']))
 
     return avgs
 
@@ -796,19 +815,16 @@ class Plotter:
     def plot_latency_breakdown_comparison(self, workload):
         transaction_size = self.parameters.transaction_size
 
-        # 시각화 설정
-        bar_width = 200  # 막대 너비 (X축이 TPS이므로 값에 따라 조절 필요)
-        sub_bar_width = bar_width * 0.4 # 서브 태스크(Verify 등) 막대 너비
-        offset = bar_width / 2 + 50 # FPC와 C-Path 막대 사이 간격
+        # [설정] 막대 크기 및 색상
+        bar_width = 250
+        sub_bar_width = 80
 
-        # 색상 정의
         colors = {
-            'queue': '#cccccc',      # 회색
-            'batching': '#1f77b4',   # 파랑 (Batching 메인)
-            'verify': '#ff7f0e',     # 주황 (Verify - 서브)
+            'queue': '#999999',      # 회색
+            'verify': '#ff7f0e',     # 주황
+            'pre_con': '#1f77b4',    # 파랑
             'cert': '#2ca02c',       # 초록
-            'commit_fpc': '#d62728', # 빨강 (FPC Commit)
-            'commit_c': '#9467bd'    # 보라 (C-Path Commit)
+            'commit': '#d62728',     # 빨강 (통합 Commit)
         }
 
         for n in self.parameters.nodes:
@@ -823,86 +839,62 @@ class Plotter:
                 breakdown_data = []
 
                 for m in measurements:
+                    # 전역 함수 호출
                     tps = aggregate_tps(m, workload[0])
                     if tps == 0: continue
 
                     comps = aggregate_breakdown_components(m, workload[0])
                     if not comps: continue
 
+                    # Commit 통합 (FPC + C-Path)
+                    comps['commit_total'] = comps['commit_fpc'] + comps['commit_c']
+
+                    print(f"[SUCCESS] Load: {m['parameters']['load']} | TPS: {tps:.2f} | Commit(Total): {comps['commit_total']:.4f}")
+
                     tps_points.append(tps)
                     breakdown_data.append(comps)
 
                 if not tps_points: continue
 
-                plt.figure(figsize=(10, 6))
+                plt.figure(figsize=(10, 7))
                 ax = plt.gca()
 
-                # 데이터 플로팅
+                # --- 데이터 플로팅 (단일 스택) ---
                 for i, tps in enumerate(tps_points):
                     d = breakdown_data[i]
+                    x_pos = tps
 
-                    # X 좌표 설정 (FPC는 왼쪽, C-Path는 오른쪽)
-                    x_fpc = tps - offset
-                    x_c = tps + offset
+                    # 1. Main Stack: Pre-Con -> Cert -> Commit
+                    b = 0
+                    ax.bar(x_pos, d['pre_con'], width=bar_width, color=colors['pre_con'], edgecolor='black', label='Pre-Consensus' if i==0 else "")
+                    b += d['pre_con']
 
-                    # --- 1. FPC Stack ---
-                    # Queue
-                    b_q = 0
-                    ax.bar(x_fpc, d['queue'], width=bar_width, color=colors['queue'], edgecolor='black', linewidth=0.5)
-                    b_batch = b_q + d['queue']
+                    ax.bar(x_pos, d['cert'], bottom=b, width=bar_width, color=colors['cert'], edgecolor='black', label='Certification' if i==0 else "")
+                    b += d['cert']
 
-                    # Batching (Verify 포함 시각화)
-                    # 메인 Batching 막대
-                    ax.bar(x_fpc, d['batching'] + d['verify'], bottom=b_batch, width=bar_width, color=colors['batching'], edgecolor='black', linewidth=0.5, label='Batching' if i==0 else "")
+                    ax.bar(x_pos, d['commit_total'], bottom=b, width=bar_width, color=colors['commit'], edgecolor='black', label='Commit' if i==0 else "")
 
-                    # Verify (서브 막대 - Batching 옆에 겹쳐서 표현)
-                    # 위치: FPC 막대의 오른쪽 끝부분에 걸치게
-                    ax.bar(x_fpc + bar_width/2, d['verify'], bottom=b_batch, width=sub_bar_width, color=colors['verify'], edgecolor='black', linewidth=0.5, label='Verify' if i==0 else "")
+                    # 2. Sub Stack (Queue -> Verify): Main 바로 왼쪽 옆에
+                    x_sub = x_pos - (bar_width/2) - (sub_bar_width/2) - 10
+                    b_sub = 0
+                    ax.bar(x_sub, d['queue'], width=sub_bar_width, color=colors['queue'], edgecolor='black', alpha=0.8, label='Queue' if i==0 else "")
+                    b_sub += d['queue']
 
-                    b_cert = b_batch + d['batching'] + d['verify']
+                    ax.bar(x_sub, d['verify'], bottom=b_sub, width=sub_bar_width, color=colors['verify'], edgecolor='black', alpha=0.8, label='Verify' if i==0 else "")
 
-                    # Certification
-                    ax.bar(x_fpc, d['cert'], bottom=b_cert, width=bar_width, color=colors['cert'], edgecolor='black', linewidth=0.5)
-                    b_commit = b_cert + d['cert']
+                # --- 범례 및 축 설정 ---
+                ax.legend(loc='upper left')
+                plt.xlabel('Throughput (TPS)', fontweight='bold', fontsize=12)
+                plt.ylabel('Latency (s)', fontweight='bold', fontsize=12)
+                plt.title(f'Latency Breakdown (Combined) - {n} Nodes', fontweight='bold', fontsize=14)
+                plt.grid(axis='y', linestyle='--', alpha=0.6)
 
-                    # FPC Commit
-                    ax.bar(x_fpc, d['commit_fpc'], bottom=b_commit, width=bar_width, color=colors['commit_fpc'], edgecolor='black', linewidth=0.5, hatch='//')
-
-                    # --- 2. C-Path Stack ---
-                    # Queue & Batching & Cert (공통 부분)
-                    # 동일하게 쌓아 올림
-                    ax.bar(x_c, d['queue'], width=bar_width, color=colors['queue'], edgecolor='black', linewidth=0.5)
-
-                    # C-Path 쪽에도 Verify 표시 (선택 사항, 여기서는 Batching 통으로 표시)
-                    ax.bar(x_c, d['batching'] + d['verify'], bottom=b_batch, width=bar_width, color=colors['batching'], edgecolor='black', linewidth=0.5)
-                    ax.bar(x_c, d['cert'], bottom=b_cert, width=bar_width, color=colors['cert'], edgecolor='black', linewidth=0.5)
-
-                    # C-Path Commit
-                    ax.bar(x_c, d['commit_c'], bottom=b_commit, width=bar_width, color=colors['commit_c'], edgecolor='black', linewidth=0.5, hatch='..')
-
-                # 범례 생성 (수동으로 깔끔하게)
-                from matplotlib.patches import Patch
-                legend_elements = [
-                    Patch(facecolor=colors['queue'], edgecolor='black', label='Queue'),
-                    Patch(facecolor=colors['batching'], edgecolor='black', label='Batching/Pre-con'),
-                    Patch(facecolor=colors['verify'], edgecolor='black', label='Verify (Sub-task)'),
-                    Patch(facecolor=colors['cert'], edgecolor='black', label='Certification'),
-                    Patch(facecolor=colors['commit_fpc'], edgecolor='black', hatch='//', label='FPC Commit'),
-                    Patch(facecolor=colors['commit_c'], edgecolor='black', hatch='..', label='C-Path Commit'),
-                ]
-                ax.legend(handles=legend_elements, loc='upper left')
-
-                plt.xlabel('Throughput (TPS)', fontweight='bold')
-                plt.ylabel('Latency (s)', fontweight='bold')
-                plt.title(f'Latency Breakdown: FPC (Left) vs C-Path (Right) - {n} Nodes', fontweight='bold')
-                plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-                # X축 눈금 정리
+                # X축 눈금 설정
                 plt.xticks(tps_points, [f"{int(x)}" for x in tps_points])
 
-                plot_name = f'breakdown-compare-{n}-{transaction_size}.png'
+                plot_name = f'breakdown-single-{n}-{transaction_size}.png'
                 filename = os.path.join(self._make_plot_directory(), plot_name)
-                plt.savefig(filename, bbox_inches='tight')
+                plt.savefig(filename, bbox_inches='tight', dpi=300)
                 print(f"Generated {filename}")
 
     def plot_duration(self, file, precision, workload):

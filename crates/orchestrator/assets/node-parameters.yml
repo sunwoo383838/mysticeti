@@ -1,4 +1,4 @@
 leader_timeout:
-  secs: 1
+  secs: 10
   nanos: 0
 consensus_only: false

@@ -22,7 +22,7 @@ type BucketId = String;
 type Label = String;
 
 // Constants for steady state window calculation
-const WARM_UP: Duration = Duration::from_secs(40);
+const WARM_UP: Duration = Duration::from_secs(240);
 const COOLDOWN: Duration = Duration::from_secs(3);
 
 /// A snapshot measurement at a given time.

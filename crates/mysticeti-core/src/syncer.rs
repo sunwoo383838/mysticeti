@@ -89,11 +89,14 @@ impl<H: BlockHandler, S: SyncerSignals> Syncer<H, S> {
             .metrics
             .utilization_timer
             .utilization_timer("Syncer::try_new_block");
+
+        // 1. 블록 생성 조건 확인 (타임아웃 or 쿼럼 달성)
         if self.force_new_block
             || self
-                .core
-                .ready_new_block(self.commit_period, &self.connected_authorities)
+            .core
+            .ready_new_block(self.commit_period, &self.connected_authorities)
         {
+            // 2. 블록 생성 시도
             if self.core.try_new_block().is_none() {
                 return;
             }
@@ -102,9 +105,11 @@ impl<H: BlockHandler, S: SyncerSignals> Syncer<H, S> {
 
             if self.core.epoch_closed() {
                 return;
-            }; // No need to commit after epoch is safe to close
+            };
 
             let newly_committed = self.core.try_commit();
+
+            // (선택 사항) 로그 출력용
             let utc_now = timestamp_utc();
             if !newly_committed.is_empty() {
                 let committed_refs: Vec<_> = newly_committed
@@ -119,29 +124,8 @@ impl<H: BlockHandler, S: SyncerSignals> Syncer<H, S> {
                 tracing::debug!("Committed {:?}", committed_refs);
             }
 
-            if !newly_committed.is_empty() {
-                // 기존의 복잡한 block_store 클론 및 명시적 스코프({}) 코드를 모두 제거하고
-                // Core의 헬퍼 메서드 하나로 대체합니다.
-                let (committed_subdag, aggregator_state) =
-                    self.core.process_committed_leaders(newly_committed);
-
-                // 최종 처리 결과(SubDag)를 Core에 반영 (WAL 기록 등)
-                self.core.handle_committed_subdag(
-                    committed_subdag,
-                    &aggregator_state,
-                );
-            }
         }
     }
-
-    pub fn commit_observer_mut(&mut self) -> &mut CommitHandler {
-        self.core.commit_handler_mut()
-    }
-
-    pub fn commit_observer(&self) -> &CommitHandler {
-        self.core.commit_handler()
-    }
-
 
     pub fn core(&self) -> &Core<H> {
         &self.core
