@@ -67,6 +67,7 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
 
     // 🌟 [Mode 1] 블록 단위 FPC - 메트릭 기록 로직 추가
     fn process_block_level(&mut self, block: &Data<StatementBlock>) {
+        tracing::info!("블록처리");
         if self.block_aggregator.contains_key(block.reference()) {
             return;
         }

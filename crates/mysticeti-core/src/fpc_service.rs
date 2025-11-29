@@ -88,6 +88,8 @@ impl FpcService {
     }
 
     fn process_block_internal(&mut self, block: Data<StatementBlock>) {
+        tracing::info!("process block");
+
         // LedgerWriter로서 self.commit_handler를 전달
         let mut interpreter = FinalizationInterpreter::new(
             &self.block_store,
@@ -105,6 +107,7 @@ impl FpcService {
 
     // ✅ C-Path 처리 로직 (DB I/O 포함)
     fn process_committed_leaders(&mut self, committed_leaders: Vec<Data<StatementBlock>>) {
+        tracing::info!("commit leaders");
         self.commit_handler.handle_commit(
             &self.block_store,
             committed_leaders,

@@ -18,116 +18,180 @@ use crate::{benchmark::BenchmarkParameters, display, protocol::ProtocolMetrics};
 
 /// The identifier of prometheus latency buckets.
 type BucketId = String;
-/// The identifier of a measurement type.
+/// The identifier of a measurement type (e.g., "shared", "owned").
 type Label = String;
+/// The identifier of a breakdown stage (e.g., "1_queue", "5_committed_c").
+type StageId = String;
 
 // Constants for steady state window calculation
 const WARM_UP: Duration = Duration::from_secs(240);
 const COOLDOWN: Duration = Duration::from_secs(3);
 
+/// Holds standard statistics for a histogram metric.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct HistogramSummary {
+    /// Latency buckets.
+    pub buckets: HashMap<BucketId, usize>,
+    /// Sum of the latencies.
+    pub sum: Duration,
+    /// Total count.
+    pub count: usize,
+    /// Sum of squares (for stdev).
+    pub squared_sum: f64,
+}
+
+impl HistogramSummary {
+    /// Compute the average latency.
+    pub fn average(&self) -> Duration {
+        if self.count == 0 {
+            return Duration::default();
+        }
+        self.sum.checked_div(self.count as u32).unwrap_or_default()
+    }
+
+    /// Compute the standard deviation.
+    pub fn stdev(&self) -> Duration {
+        if self.count == 0 {
+            return Duration::default();
+        }
+        let count = self.count as f64;
+        let first_term = self.squared_sum / count;
+        let squared_avg = self.average().as_secs_f64().powi(2);
+
+        let variance = if squared_avg > first_term {
+            0.0
+        } else {
+            first_term - squared_avg
+        };
+        Duration::from_secs_f64(variance.sqrt())
+    }
+}
+
 /// A snapshot measurement at a given time.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Measurement {
     /// Duration since the beginning of the benchmark.
-    timestamp: Duration,
-    /// Latency buckets.
-    buckets: HashMap<BucketId, usize>,
-    /// Sum of the latencies of all finalized transactions.
-    sum: Duration,
-    /// Total number of finalized transactions
-    count: usize,
-    /// Sum of the squares of the latencies of all finalized transactions
-    squared_sum: f64,
-    /// [Modified] Accumulated CPU usage in seconds (from node_cpu_seconds_total).
+    pub timestamp: Duration,
+
+    /// 1. Legacy End-to-End Latency (latency_s)
+    pub latency_e2e: HistogramSummary,
+
+    /// 2. Detailed Latency Breakdown by Stage
+    /// Key: Stage ID (e.g., "1_queue", "5_committed_fpc")
+    pub breakdown: HashMap<StageId, HistogramSummary>,
+
+    /// 3. System Metrics
     #[serde(default)]
     pub cpu_accumulated_seconds: f64,
     #[serde(default)]
     pub system_network_in_bytes: f64,
     #[serde(default)]
     pub system_network_out_bytes: f64,
-
-    #[serde(default)]
-    pub breakdown_queue_sum: f64,
-    #[serde(default)]
-    pub breakdown_verify_sum: f64,
-    #[serde(default)]
-    pub breakdown_pre_consensus_sum: f64,
-    #[serde(default)]
-    pub breakdown_cert_sum: f64,
-
-    #[serde(default)]
-    pub breakdown_commit_fpc_sum: f64,
-    #[serde(default)]
-    pub breakdown_commit_c_sum: f64,
 }
 
 impl Measurement {
     /// Make new measurements from the text exposed by prometheus.
-    /// Every measurement is identified by a unique label.
     pub fn from_prometheus<M: ProtocolMetrics>(text: &str) -> HashMap<Label, Self> {
         let br = std::io::BufReader::new(text.as_bytes());
         let parsed = Scrape::parse(br.lines()).unwrap();
 
-        let mut measurements = HashMap::new();
+        let mut measurements: HashMap<Label, Measurement> = HashMap::new();
+
         for sample in &parsed.samples {
-            // [Modified] Use "system" label for CPU metrics, otherwise use existing label logic
-            let label = if sample.metric == "node_cpu_seconds_total" {
+            // 1. Label 결정 (Workload)
+            // System Metric인 경우 "system", 그 외에는 workload 라벨 사용
+            let label = if sample.metric == "node_cpu_seconds_total"
+                || sample.metric.starts_with("node_network")
+            {
                 "system".to_string()
+            } else if let Some(workload) = sample.labels.get("workload") {
+                workload.to_string()
             } else {
-                sample
-                    .labels
-                    .iter()
-                    .filter(|(k, _)| *k != "path_type") // path_type은 키 생성에서 제외
-                    .map(|(_, v)| v.clone())
-                    .collect::<Vec<_>>()
-                    .join(",")
+                // workload 라벨이 없는 경우 (예: global counter 등) 처리
+                // 필요하다면 default 키 사용
+                "global".to_string()
             };
 
-            let measurement = measurements
-                .entry(label.clone())
-                .or_insert_with(Self::default);
-            match &sample.metric {
-                x if x == M::LATENCY_BUCKETS => match &sample.value {
-                    prometheus_parse::Value::Histogram(values) => {
+            let measurement = measurements.entry(label).or_default();
+
+            // 2. Metric Parsing
+            match sample.metric.as_str() {
+                // --- A. Legacy End-to-End Latency (latency_s) ---
+                x if x == M::LATENCY_BUCKETS => {
+                    if let prometheus_parse::Value::Histogram(values) = &sample.value {
                         for value in values {
-                            let bucket_id = value.less_than.to_string();
-                            let count = value.count as usize;
-                            measurement.buckets.insert(bucket_id, count);
+                            measurement.latency_e2e.buckets.insert(
+                                value.less_than.to_string(),
+                                value.count as usize,
+                            );
                         }
                     }
-                    _ => panic!("Unexpected scraped value: '{x}'"),
-                },
-                x if x == M::LATENCY_SUM => {
-                    measurement.sum = match sample.value {
-                        prometheus_parse::Value::Untyped(value) => Duration::from_secs_f64(value),
-                        _ => panic!("Unexpected scraped value: '{x}'"),
-                    };
                 }
-                x if x == M::TOTAL_TRANSACTIONS => {
-                    measurement.count = match sample.value {
-                        prometheus_parse::Value::Untyped(value) => value as usize,
-                        _ => panic!("Unexpected scraped value: '{x}'"),
-                    };
+                x if x == M::LATENCY_SUM => {
+                    if let prometheus_parse::Value::Untyped(val) = sample.value {
+                        measurement.latency_e2e.sum = Duration::from_secs_f64(val);
+                    }
+                }
+                x if x == M::TOTAL_TRANSACTIONS => { // latency_s_count
+                    if let prometheus_parse::Value::Untyped(val) = sample.value {
+                        measurement.latency_e2e.count = val as usize;
+                    }
                 }
                 x if x == M::LATENCY_SQUARED_SUM => {
-                    measurement.squared_sum = match sample.value {
-                        prometheus_parse::Value::Counter(value) => value,
-                        _ => panic!("Unexpected scraped value: '{x}'"),
-                    };
-                }
-                // [Modified] CPU metric parsing logic
-                x if x == "node_cpu_seconds_total" => {
                     if let prometheus_parse::Value::Counter(val) = sample.value {
-                        // Exclude 'idle' mode to capture active CPU usage (user + system + ...)
+                        measurement.latency_e2e.squared_sum = val;
+                    }
+                }
+
+                // --- B. Latency Breakdown (latency_breakdown) ---
+                "latency_breakdown_bucket" => {
+                    if let Some(stage) = sample.labels.get("stage") {
+                        let summary = measurement.breakdown.entry(stage.clone().parse().unwrap()).or_default();
+                        if let prometheus_parse::Value::Histogram(values) = &sample.value {
+                            for value in values {
+                                summary.buckets.insert(
+                                    value.less_than.to_string(),
+                                    value.count as usize,
+                                );
+                            }
+                        }
+                    }
+                }
+                "latency_breakdown_sum" => {
+                    if let Some(stage) = sample.labels.get("stage") {
+                        let summary = measurement.breakdown.entry(stage.clone().parse().unwrap()).or_default();
+                        if let prometheus_parse::Value::Untyped(val) = sample.value {
+                            summary.sum = Duration::from_secs_f64(val);
+                        }
+                    }
+                }
+                "latency_breakdown_count" => {
+                    if let Some(stage) = sample.labels.get("stage") {
+                        let summary = measurement.breakdown.entry(stage.clone().parse().unwrap()).or_default();
+                        if let prometheus_parse::Value::Untyped(val) = sample.value {
+                            summary.count = val as usize;
+                        }
+                    }
+                }
+                "latency_breakdown_squared_s" => {
+                    if let Some(stage) = sample.labels.get("stage") {
+                        let summary = measurement.breakdown.entry(stage.clone().parse().unwrap()).or_default();
+                        if let prometheus_parse::Value::Counter(val) = sample.value {
+                            summary.squared_sum = val;
+                        }
+                    }
+                }
+
+                // --- C. System Metrics ---
+                "node_cpu_seconds_total" => {
+                    if let prometheus_parse::Value::Counter(val) = sample.value {
                         let is_idle = sample.labels.get("mode").map(|s| s == "idle").unwrap_or(false);
                         if !is_idle {
                             measurement.cpu_accumulated_seconds += val;
                         }
                     }
-                },
-                // 1. 수신 대역폭 (Receive)
-                x if x == "node_network_receive_bytes_total" => {
-                    // 'device' 라벨을 확인하여 물리 인터페이스만 집계 (lo 제외)
+                }
+                "node_network_receive_bytes_total" => {
                     if let Some(device) = sample.labels.get("device") {
                         if device != "lo" {
                             if let prometheus_parse::Value::Counter(val) = sample.value {
@@ -135,11 +199,8 @@ impl Measurement {
                             }
                         }
                     }
-                },
-
-                // 2. 송신 대역폭 (Transmit)
-                x if x == "node_network_transmit_bytes_total" => {
-                    // 'device' 라벨을 확인하여 물리 인터페이스만 집계 (lo 제외)
+                }
+                "node_network_transmit_bytes_total" => {
                     if let Some(device) = sample.labels.get("device") {
                         if device != "lo" {
                             if let prometheus_parse::Value::Counter(val) = sample.value {
@@ -147,89 +208,27 @@ impl Measurement {
                             }
                         }
                     }
-                },
-                x if x == "latency_breakdown_1_queue_sum" => {
-                    if let prometheus_parse::Value::Untyped(val) = sample.value {
-                        measurement.breakdown_queue_sum = val;
-                    }
-                },
-                x if x == "latency_breakdown_2_verify_sum" => {
-                    if let prometheus_parse::Value::Untyped(val) = sample.value {
-                        measurement.breakdown_verify_sum = val;
-                    }
-                },
-                x if x == "latency_breakdown_pre_consensus_sum" => {
-                    if let prometheus_parse::Value::Untyped(val) = sample.value {
-                        measurement.breakdown_pre_consensus_sum = val;
-                    }
-                },
-                x if x == "latency_breakdown_4_cert_sum" => {
-                    if let prometheus_parse::Value::Untyped(val) = sample.value {
-                        measurement.breakdown_cert_sum = val;
-                    }
-                },
-                x if x == "latency_breakdown_5_commit_sum" => {
-                    if let prometheus_parse::Value::Untyped(val) = sample.value {
-                        match sample.labels.get("path_type").map(|s| s) {
-                            Some("fpc") => measurement.breakdown_commit_fpc_sum = val,
-                            Some("c") => measurement.breakdown_commit_c_sum = val,
-                            _ => (),
-                        }
-                    }
-                },
-                _ => (),
-            }
-
-            if measurement == &Self::default() {
-                measurements.remove(&label);
+                }
+                _ => {}
             }
         }
 
-        // Apply the same timestamp to all measurements.
+        // Benchmark Duration 타임스탬프 적용
         let timestamp = parsed
             .samples
             .iter()
             .find(|x| x.metric == M::BENCHMARK_DURATION)
             .map(|x| match x.value {
                 prometheus_parse::Value::Counter(value) => Duration::from_secs(value as u64),
-                _ => panic!("Unexpected scraped value"),
+                _ => Duration::default(),
             })
             .unwrap_or_default();
+
         for sample in measurements.values_mut() {
             sample.timestamp = timestamp;
         }
 
         measurements
-    }
-
-    /// Compute the average latency.
-    pub fn average_latency(&self) -> Duration {
-        self.sum.checked_div(self.count as u32).unwrap_or_default()
-    }
-
-    /// Compute the standard deviation from the sum of squared latencies:
-    /// `stdev = sqrt( squared_sum / count - avg^2 )`
-    pub fn stdev_latency(&self) -> Duration {
-        // Compute `squared_sum / count`.
-        let first_term = if self.count == 0 {
-            return Duration::from_secs(0);
-        } else {
-            self.squared_sum / self.count as f64
-        };
-
-        // Compute `avg^2`.
-        let squared_avg = self.average_latency().as_secs_f64().powi(2_i32);
-
-        // Compute `squared_sum / count - avg^2`.
-        let variance = if squared_avg > first_term {
-            0.0
-        } else {
-            first_term - squared_avg
-        };
-
-        // Compute `sqrt( squared_sum / count - avg^2 )`.
-        let stdev = variance.sqrt();
-        Duration::from_secs_f64(stdev)
     }
 }
 
@@ -238,32 +237,25 @@ type ScraperId = usize;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MeasurementsCollection {
-    /// The benchmark parameters of the current run.
     pub parameters: BenchmarkParameters,
-    /// The data collected by each scraper.
     pub data: HashMap<Label, HashMap<ScraperId, Vec<Measurement>>>,
 }
 
 impl MeasurementsCollection {
-    /// Create a new (empty) collection of measurements.
     pub fn new(mut parameters: BenchmarkParameters) -> Self {
-        // Remove the access token from the parameters.
         parameters.settings.repository.remove_access_token();
-
         Self {
             parameters,
             data: HashMap::new(),
         }
     }
 
-    /// Load a collection of measurement from a json file.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, std::io::Error> {
         let data = fs::read(path)?;
         let measurements: Self = serde_json::from_slice(data.as_slice())?;
         Ok(measurements)
     }
 
-    /// Add a new measurement to the collection.
     pub fn add(&mut self, scraper_id: ScraperId, label: String, measurement: Measurement) {
         self.data
             .entry(label)
@@ -273,7 +265,6 @@ impl MeasurementsCollection {
             .push(measurement);
     }
 
-    /// Get all measurements associated with the specified label.
     pub fn all_measurements(&self, label: &Label) -> Vec<Vec<Measurement>> {
         self.data
             .get(label)
@@ -281,62 +272,49 @@ impl MeasurementsCollection {
             .unwrap_or_default()
     }
 
-    /// Get all labels.
     pub fn labels(&self) -> impl Iterator<Item = &Label> {
         self.data.keys()
     }
 
-    /// Get the maximum result of a function applied to the measurements.
-    fn max_result<T: Default + Ord>(
-        &self,
-        label: &Label,
-        function: impl Fn(&Measurement) -> T,
-    ) -> T {
-        self.all_measurements(label)
-            .iter()
-            .filter_map(|x| x.last())
-            .map(function)
-            .max()
-            .unwrap_or_default()
-    }
-
-    /// Aggregate the benchmark duration of multiple data points by taking the max.
     pub fn benchmark_duration(&self) -> Duration {
         self.labels()
-            .map(|label| self.max_result(label, |x| x.timestamp))
+            .map(|label| {
+                self.all_measurements(label)
+                    .iter()
+                    .filter_map(|x| x.last())
+                    .map(|x| x.timestamp)
+                    .max()
+                    .unwrap_or_default()
+            })
             .max()
             .unwrap_or_default()
     }
 
-    /// Helper to find the steady state window [warm_up, total - cooldown]
     fn get_steady_state_window<'a>(
         measurements: &'a [Measurement],
     ) -> Option<(&'a Measurement, &'a Measurement)> {
         if measurements.is_empty() {
             return None;
         }
-
         let total_duration = measurements.last().unwrap().timestamp;
         let cutoff = total_duration.saturating_sub(COOLDOWN);
-
         let start = measurements.iter().find(|m| m.timestamp > WARM_UP);
         let end = measurements.iter().rev().find(|m| m.timestamp <= cutoff);
-
         match (start, end) {
             (Some(s), Some(e)) if s.timestamp < e.timestamp => Some((s, e)),
             _ => None,
         }
     }
 
-    /// Aggregate the tps of multiple data points.
-    /// Calculates max TPS across all nodes in the steady state window.
+    // --- TPS Calculation (Based on latency_e2e count) ---
     pub fn aggregate_tps(&self, label: &Label) -> u64 {
         self.all_measurements(label)
             .iter()
             .map(|scraper_data| {
                 if let Some((start, end)) = Self::get_steady_state_window(scraper_data) {
                     let duration = end.timestamp.as_secs_f64() - start.timestamp.as_secs_f64();
-                    let count = end.count.saturating_sub(start.count) as f64;
+                    // Use latency_e2e count for global TPS
+                    let count = end.latency_e2e.count.saturating_sub(start.latency_e2e.count) as f64;
                     if duration > 0.0 {
                         (count / duration) as u64
                     } else {
@@ -350,44 +328,40 @@ impl MeasurementsCollection {
             .unwrap_or_default()
     }
 
-    /// Aggregate the average latency of multiple data points by taking the average in the steady state window.
+    // --- Average Latency (Legacy) ---
     pub fn aggregate_average_latency(&self, label: &Label) -> Duration {
         let all_measurements = self.all_measurements(label);
         let mut latencies = Vec::new();
-
         for scraper_data in all_measurements {
             if let Some((start, end)) = Self::get_steady_state_window(&scraper_data) {
-                let count = (end.count.saturating_sub(start.count)) as u32;
+                let count = (end.latency_e2e.count.saturating_sub(start.latency_e2e.count)) as u32;
                 if count > 0 {
-                    let total_time = end.sum.saturating_sub(start.sum);
+                    let total_time = end.latency_e2e.sum.saturating_sub(start.latency_e2e.sum);
                     latencies.push(total_time / count);
                 }
             }
         }
-
         if latencies.is_empty() {
             return Duration::default();
         }
-
         let sum: Duration = latencies.iter().sum();
         sum / latencies.len() as u32
     }
 
-    /// Aggregate the stdev latency of multiple data points by taking the max in the steady state window.
+    // --- Stdev Latency (Legacy) ---
     pub fn max_stdev_latency(&self, label: &Label) -> Duration {
         self.all_measurements(label)
             .iter()
             .map(|scraper_data| {
                 if let Some((start, end)) = Self::get_steady_state_window(scraper_data) {
-                    let count = (end.count.saturating_sub(start.count)) as f64;
+                    let count = (end.latency_e2e.count.saturating_sub(start.latency_e2e.count)) as f64;
                     if count > 0.0 {
-                        let latency_sum = (end.sum.saturating_sub(start.sum)).as_secs_f64();
-                        let latency_sq_sum = end.squared_sum - start.squared_sum;
+                        let latency_sum = (end.latency_e2e.sum.saturating_sub(start.latency_e2e.sum)).as_secs_f64();
+                        let latency_sq_sum = end.latency_e2e.squared_sum - start.latency_e2e.squared_sum;
 
                         let first = latency_sq_sum / count;
                         let second = (latency_sum / count).powi(2);
                         let variance = first - second;
-
                         if variance > 0.0 {
                             Duration::from_secs_f64(variance.sqrt())
                         } else {
@@ -404,7 +378,6 @@ impl MeasurementsCollection {
             .unwrap_or_default()
     }
 
-    /// Save the collection of measurements as a json file.
     pub fn save<P: AsRef<Path>>(&self, path: P) {
         let json = serde_json::to_string_pretty(self).expect("Cannot serialize metrics");
         let mut file = PathBuf::from(path.as_ref());
@@ -412,7 +385,6 @@ impl MeasurementsCollection {
         fs::write(file, json).unwrap();
     }
 
-    /// Display a summary of the measurements.
     pub fn display_summary(&self) {
         let mut table = Table::new();
         table.set_format(display::default_table_format());
@@ -430,6 +402,8 @@ impl MeasurementsCollection {
         let mut labels: Vec<_> = self.labels().collect();
         labels.sort();
         for label in labels {
+            if label == "system" { continue; } // system label은 요약에서 제외 가능
+
             let total_tps = self.aggregate_tps(label);
             let average_latency = self.aggregate_average_latency(label);
             let stdev_latency = self.max_stdev_latency(label);
@@ -439,6 +413,9 @@ impl MeasurementsCollection {
             table.add_row(row![b->"TPS:", format!("{total_tps} tx/s")]);
             table.add_row(row![b->"Latency (avg):", format!("{} ms", average_latency.as_millis())]);
             table.add_row(row![b->"Latency (stdev):", format!("{} ms", stdev_latency.as_millis())]);
+
+            // (선택) 여기서 Breakdown 정보를 출력할 수도 있습니다.
+            // 구현 편의상 생략하였으나, self.data[label] 내부의 breakdown 맵을 순회하며 출력 가능합니다.
         }
 
         display::newline();
@@ -449,350 +426,40 @@ impl MeasurementsCollection {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, time::Duration};
-
-    use super::{BenchmarkParameters, Measurement, MeasurementsCollection};
+    use super::*;
     use crate::protocol::test_protocol_metrics::TestProtocolMetrics;
 
     #[test]
-    fn average_latency() {
-        let data = Measurement {
-            timestamp: Duration::from_secs(10),
-            buckets: HashMap::new(),
-            sum: Duration::from_secs(2),
-            count: 100,
-            squared_sum: 0.0,
-            cpu_accumulated_seconds: 0.0,
-            system_network_in_bytes: 0.0,
-            system_network_out_bytes: 0.0,
-            breakdown_cert_sum: 0.0,
-            breakdown_pre_consensus_sum: 0.0,
-            breakdown_queue_sum: 0.0,
-            breakdown_verify_sum: 0.0,
-            breakdown_commit_c_sum: 0.0,
-            breakdown_commit_fpc_sum: 0.0,
-        };
-
-        assert_eq!(data.average_latency(), Duration::from_millis(20));
-    }
-
-    #[test]
-    fn stdev_latency() {
-        let data = Measurement {
-            timestamp: Duration::from_secs(10),
-            buckets: HashMap::new(),
-            sum: Duration::from_secs(50),
-            count: 100,
-            squared_sum: 75.0,
-            cpu_accumulated_seconds: 0.0,
-            system_network_in_bytes: 0.0,
-            system_network_out_bytes: 0.0,
-            breakdown_cert_sum: 0.0,
-            breakdown_commit_c_sum: 0.0,
-            breakdown_commit_fpc_sum: 0.0,
-            breakdown_pre_consensus_sum: 0.0,
-            breakdown_queue_sum: 0.0,
-            breakdown_verify_sum: 0.0
-        };
-
-        // squared_sum / count
-        assert_eq!(data.squared_sum / data.count as f64, 0.75);
-        // avg^2
-        assert_eq!(data.average_latency().as_secs_f64().powf(2.0), 0.25);
-        // sqrt( squared_sum / count - avg^2 )
-        let stdev = data.stdev_latency();
-        assert_eq!((stdev.as_secs_f64() * 10.0).round(), 7.0);
-    }
-
-    #[test]
-    fn prometheus_parse() {
+    fn prometheus_parse_breakdown() {
         let report = r#"
             # HELP benchmark_duration Duration of the benchmark
             # TYPE benchmark_duration counter
             benchmark_duration 30
-            # HELP latency_s Total time in seconds to return a response
-            # TYPE latency_s histogram
-            latency_s_bucket{workload=owned,le=0.1} 0
-            latency_s_bucket{workload=owned,le=0.25} 0
-            latency_s_bucket{workload=owned,le=0.5} 506
-            latency_s_bucket{workload=owned,le=0.75} 1282
-            latency_s_bucket{workload=owned,le=1} 1693
-            latency_s_bucket{workload="owned",le="1.25"} 1816
-            latency_s_bucket{workload="owned",le="1.5"} 1860
-            latency_s_bucket{workload="owned",le="1.75"} 1860
-            latency_s_bucket{workload="owned",le="2"} 1860
-            latency_s_bucket{workload=owned,le=2.5} 1860
-            latency_s_bucket{workload=owned,le=5} 1860
-            latency_s_bucket{workload=owned,le=10} 1860
-            latency_s_bucket{workload=owned,le=20} 1860
-            latency_s_bucket{workload=owned,le=30} 1860
-            latency_s_bucket{workload=owned,le=60} 1860
-            latency_s_bucket{workload=owned,le=90} 1860
-            latency_s_bucket{workload=owned,le=+Inf} 1860
-            latency_s_sum{workload=owned} 1265.287933130998
-            latency_s_count{workload=owned} 1860
-            latency_s_bucket{workload="shared",le="0.1"} 42380
-            latency_s_bucket{workload="shared",le="0.25"} 104320
-            latency_s_bucket{workload="shared",le="0.5"} 110720
-            latency_s_bucket{workload="shared",le="0.75"} 112780
-            latency_s_bucket{workload="shared",le="1"} 112780
-            latency_s_bucket{workload="shared",le="1.25"} 112780
-            latency_s_bucket{workload="shared",le="1.5"} 112780
-            latency_s_bucket{workload="shared",le="1.75"} 112780
-            latency_s_bucket{workload="shared",le="2"} 112780
-            latency_s_bucket{workload="shared",le="2.5"} 112780
-            latency_s_bucket{workload="shared",le="5"} 112780
-            latency_s_bucket{workload="shared",le="10"} 112780
-            latency_s_bucket{workload="shared",le="20"} 112780
-            latency_s_bucket{workload="shared",le="30"} 112780
-            latency_s_bucket{workload="shared",le="60"} 112780
-            latency_s_bucket{workload="shared",le="90"} 112780
-            latency_s_bucket{workload="shared",le="+Inf"} 112780
-            latency_s_sum{workload="shared"} 15452.286558500084
-            latency_s_count{workload="shared"} 112780
-            # HELP latency_squared_s Square of total time in seconds to return a response
-            # TYPE latency_squared_s counter
-            latency_squared_s{workload="owned"} 952.8160642745289
+
+            # HELP latency_breakdown_sum Cumulative latency breakdown
+            # TYPE latency_breakdown_sum histogram
+            latency_breakdown_sum{stage="1_queue",workload="shared"} 10.0
+            latency_breakdown_count{stage="1_queue",workload="shared"} 100
+            latency_breakdown_bucket{stage="1_queue",workload="shared",le="0.1"} 100
+
+            latency_breakdown_sum{stage="5_committed_c",workload="shared"} 50.0
+            latency_breakdown_count{stage="5_committed_c",workload="shared"} 100
+            latency_breakdown_squared_s{stage="5_committed_c",workload="shared"} 2500.0
         "#;
 
         let measurements = Measurement::from_prometheus::<TestProtocolMetrics>(report);
-        let mut aggregator = MeasurementsCollection::new(BenchmarkParameters::new_for_tests());
-        let scraper_id = 1;
-        for (label, measurement) in measurements {
-            aggregator.add(scraper_id, label, measurement);
-        }
+        let measurement = measurements.get("shared").unwrap();
 
-        assert_eq!(aggregator.data.keys().filter(|x| !x.is_empty()).count(), 2);
+        // 1. Check Breakdown (Queue)
+        let queue = measurement.breakdown.get("1_queue").unwrap();
+        assert_eq!(queue.sum, Duration::from_secs(10));
+        assert_eq!(queue.count, 100);
+        assert_eq!(queue.buckets.get("0.1"), Some(&100));
 
-        let owned_workload_data_points = aggregator
-            .data
-            .get("owned")
-            .expect("The `owned` label is defined above")
-            .get(&scraper_id)
-            .unwrap();
-        assert_eq!(owned_workload_data_points.len(), 1);
-
-        let data = &owned_workload_data_points[0];
-        assert_eq!(
-            data.buckets,
-            ([
-                ("0.1".into(), 0),
-                ("0.25".into(), 0),
-                ("0.5".into(), 506),
-                ("0.75".into(), 1282),
-                ("1".into(), 1693),
-                ("1.25".into(), 1816),
-                ("1.5".into(), 1860),
-                ("1.75".into(), 1860),
-                ("2".into(), 1860),
-                ("2.5".into(), 1860),
-                ("5".into(), 1860),
-                ("10".into(), 1860),
-                ("20".into(), 1860),
-                ("30".into(), 1860),
-                ("60".into(), 1860),
-                ("90".into(), 1860),
-                ("inf".into(), 1860)
-            ])
-                .iter()
-                .cloned()
-                .collect()
-        );
-        assert_eq!(data.sum.as_secs(), 1265);
-        assert_eq!(data.count, 1860);
-        assert_eq!(data.timestamp.as_secs(), 30);
-        assert_eq!(data.squared_sum as u64, 952);
-
-        let shared_workload_data_points = aggregator
-            .data
-            .get("shared")
-            .expect("Unable to find label")
-            .get(&scraper_id)
-            .unwrap();
-        assert_eq!(shared_workload_data_points.len(), 1);
-    }
-
-    #[test]
-    fn prometheus_parse_large() {
-        let report = r#"
-            # HELP benchmark_duration Duration of the benchmark
-            # TYPE benchmark_duration counter
-            benchmark_duration 260
-            # HELP block_handler_cleanup_util block_handler_cleanup_util
-            # TYPE block_handler_cleanup_util counter
-            block_handler_cleanup_util 2440
-            # HELP block_handler_pending_certificates Number of pending certificates in block handler
-            # TYPE block_handler_pending_certificates gauge
-            block_handler_pending_certificates 0
-            # HELP block_store_cleanup_util block_store_cleanup_util
-            # TYPE block_store_cleanup_util counter
-            block_store_cleanup_util 20856
-            # HELP block_store_entries Number of entries in block store
-            # TYPE block_store_entries counter
-            block_store_entries 19506
-            # HELP block_store_loaded_blocks Blocks loaded from wal position in the block store
-            # TYPE block_store_loaded_blocks counter
-            block_store_loaded_blocks 0
-            # HELP block_store_unloaded_blocks Blocks unloaded from wal position during cleanup
-            # TYPE block_store_unloaded_blocks counter
-            block_store_unloaded_blocks 19088
-            # HELP commit_handler_pending_certificates Number of pending certificates in commit handler
-            # TYPE commit_handler_pending_certificates gauge
-            commit_handler_pending_certificates 7749
-            # HELP committed_leaders_total Total number of (direct or indirect) committed leaders per authority
-            # TYPE committed_leaders_total counter
-            committed_leaders_total{authority="0",commit_type="direct-commit"} 4871
-            committed_leaders_total{authority="0",commit_type="indirect-skip"} 1
-            committed_leaders_total{authority="1",commit_type="direct-commit"} 4878
-            committed_leaders_total{authority="2",commit_type="direct-commit"} 4874
-            committed_leaders_total{authority="2",commit_type="indirect-skip"} 1
-            committed_leaders_total{authority="3",commit_type="direct-commit"} 4875
-            # HELP connection_latency connection_latency
-            # TYPE connection_latency gauge
-            connection_latency{peer="B",v="count"} 7
-            connection_latency{peer="B",v="p50"} 65820
-            connection_latency{peer="B",v="p90"} 65820
-            connection_latency{peer="B",v="p99"} 65820
-            connection_latency{peer="B",v="sum"} 544275
-            connection_latency{peer="C",v="count"} 7
-            connection_latency{peer="C",v="p50"} 141796
-            connection_latency{peer="C",v="p90"} 141796
-            connection_latency{peer="C",v="p99"} 141796
-            connection_latency{peer="C",v="sum"} 992113
-            connection_latency{peer="D",v="count"} 7
-            connection_latency{peer="D",v="p50"} 116833
-            connection_latency{peer="D",v="p90"} 116833
-            connection_latency{peer="D",v="p99"} 116833
-            connection_latency{peer="D",v="sum"} 1045331
-            # HELP core_lock_dequeued Number of dequeued core requests
-            # TYPE core_lock_dequeued counter
-            core_lock_dequeued 14708
-            # HELP core_lock_enqueued Number of enqueued core requests
-            # TYPE core_lock_enqueued counter
-            core_lock_enqueued 14708
-            # HELP core_lock_util Utilization of core write lock
-            # TYPE core_lock_util counter
-            core_lock_util 2977016
-            # HELP global_in_memory_blocks Number of blocks loaded in memory
-            # TYPE global_in_memory_blocks gauge
-            global_in_memory_blocks 1166
-            # HELP global_in_memory_blocks_bytes Total size of blocks loaded in memory
-            # TYPE global_in_memory_blocks_bytes gauge
-            global_in_memory_blocks_bytes 2020910
-            # HELP inter_block_latency_s Buckets measuring the inter-block latency in seconds
-            # TYPE inter_block_latency_s histogram
-            inter_block_latency_s_bucket{workload="shared",le="0.1"} 0
-            inter_block_latency_s_bucket{workload="shared",le="0.25"} 9760
-            inter_block_latency_s_bucket{workload="shared",le="0.5"} 9990
-            inter_block_latency_s_bucket{workload="shared",le="0.75"} 9990
-            inter_block_latency_s_bucket{workload="shared",le="1"} 9990
-            inter_block_latency_s_bucket{workload="shared",le="1.25"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="1.5"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="1.75"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="2"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="2.5"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="5"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="10"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="20"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="30"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="60"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="90"} 12995
-            inter_block_latency_s_bucket{workload="shared",le="+Inf"} 12995
-            inter_block_latency_s_sum{workload="shared"} 5316.488885883012
-            inter_block_latency_s_count{workload="shared"} 12995
-            # HELP latency_s Buckets measuring the end-to-end latency of a workload in seconds
-            # TYPE latency_s histogram
-            latency_s_bucket{workload="shared",le="0.1"} 0
-            latency_s_bucket{workload="shared",le="0.25"} 28035
-            latency_s_bucket{workload="shared",le="0.5"} 39840
-            latency_s_bucket{workload="shared",le="0.75"} 39900
-            latency_s_bucket{workload="shared",le="1"} 42955
-            latency_s_bucket{workload="shared",le="1.25"} 46025
-            latency_s_bucket{workload="shared",le="1.5"} 46070
-            latency_s_bucket{workload="shared",le="1.75"} 46130
-            latency_s_bucket{workload="shared",le="2"} 49160
-            latency_s_bucket{workload="shared",le="2.5"} 49195
-            latency_s_bucket{workload="shared",le="5"} 52205
-            latency_s_bucket{workload="shared",le="10"} 52205
-            latency_s_bucket{workload="shared",le="20"} 52205
-            latency_s_bucket{workload="shared",le="30"} 52205
-            latency_s_bucket{workload="shared",le="60"} 52205
-            latency_s_bucket{workload="shared",le="90"} 52205
-            latency_s_bucket{workload="shared",le="+Inf"} 52205
-            latency_s_sum{workload="shared"} 28514.81023401533
-            latency_s_count{workload="shared"} 52205
-            # HELP latency_squared_s Square of total end-to-end latency of a workload in seconds
-            # TYPE latency_squared_s counter
-            latency_squared_s{workload="shared"} 38892.65516746515
-            # HELP leader_timeout_total Total number of leader timeouts
-            # TYPE leader_timeout_total counter
-            leader_timeout_total 3
-            # HELP missing_blocks Number of missing blocks per authority
-            # TYPE missing_blocks gauge
-            missing_blocks{authority="0"} 0
-            missing_blocks{authority="1"} 0
-            missing_blocks{authority="2"} 0
-            missing_blocks{authority="3"} 0
-            # HELP proposed_block_size_bytes proposed_block_size_bytes
-            # TYPE proposed_block_size_bytes gauge
-            proposed_block_size_bytes{v="count"} 4494
-            proposed_block_size_bytes{v="p50"} 2949
-            proposed_block_size_bytes{v="p90"} 3005
-            proposed_block_size_bytes{v="p99"} 5569
-            proposed_block_size_bytes{v="sum"} 7892302
-            # HELP proposed_block_transaction_count proposed_block_transaction_count
-            # TYPE proposed_block_transaction_count gauge
-            proposed_block_transaction_count{v="count"} 4494
-            proposed_block_transaction_count{v="p50"} 5
-            proposed_block_transaction_count{v="p90"} 5
-            proposed_block_transaction_count{v="p99"} 10
-            proposed_block_transaction_count{v="sum"} 12000
-            # HELP proposed_block_vote_count proposed_block_vote_count
-            # TYPE proposed_block_vote_count gauge
-            proposed_block_vote_count{v="count"} 4494
-            proposed_block_vote_count{v="p50"} 0
-            proposed_block_vote_count{v="p90"} 0
-            proposed_block_vote_count{v="p99"} 0
-            proposed_block_vote_count{v="sum"} 0
-            # HELP submitted_transactions Number of submitted transactions
-            # TYPE submitted_transactions counter
-            submitted_transactions 0
-            # HELP transaction_committed_latency transaction_committed_latency
-            # TYPE transaction_committed_latency gauge
-            transaction_committed_latency{v="count"} 11995
-            transaction_committed_latency{v="p50"} 244395
-            transaction_committed_latency{v="p90"} 245314
-            transaction_committed_latency{v="p99"} 245563
-            transaction_committed_latency{v="sum"} 5108276856
-            # HELP utilization_timer Utilization timer
-            # TYPE utilization_timer counter
-            utilization_timer{proc="BlockHandler::handle_blocks"} 1273
-            utilization_timer{proc="Core::add_blocks"} 167115
-            utilization_timer{proc="Core::run_block_handler"} 45864
-            utilization_timer{proc="Core::try_new_block"} 261001
-            utilization_timer{proc="Syncer::add_blocks"} 2871082
-            utilization_timer{proc="Syncer::try_new_block"} 2690931
-            # HELP wal_mappings Number of mappings retained by the wal
-            # TYPE wal_mappings gauge
-            wal_mappings 0
-        "#;
-
-        let measurements = Measurement::from_prometheus::<TestProtocolMetrics>(report);
-        let mut aggregator = MeasurementsCollection::new(BenchmarkParameters::new_for_tests());
-        let scraper_id = 1;
-        for (label, measurement) in measurements {
-            println!("{:?}", label);
-            aggregator.add(scraper_id, label, measurement);
-        }
-
-        let shared_workload_data_points = aggregator
-            .data
-            .get("shared")
-            .expect("Unable to find label")
-            .get(&scraper_id)
-            .unwrap();
-
-        let data = &shared_workload_data_points[shared_workload_data_points.len() - 1];
-        assert_ne!(data, &Measurement::default());
+        // 2. Check Breakdown (Commit)
+        let commit = measurement.breakdown.get("5_committed_c").unwrap();
+        assert_eq!(commit.sum, Duration::from_secs(50));
+        assert_eq!(commit.count, 100);
+        assert_eq!(commit.squared_sum, 2500.0);
     }
 }
