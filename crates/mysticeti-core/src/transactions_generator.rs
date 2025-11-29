@@ -106,7 +106,6 @@ impl TransactionGenerator {
         let transactions_per_block_interval = (load + 9) / 10;
 
         let mut interval = runtime::TimeInterval::new(Self::TARGET_BLOCK_INTERVAL);
-        runtime::sleep(self.client_parameters.initial_delay).await;
 
         tracing::info!("Sending loaded transactions at {} TPS...", load);
 
