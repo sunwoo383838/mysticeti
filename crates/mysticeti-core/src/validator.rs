@@ -127,6 +127,14 @@ impl Validator {
             dkg_complete_notify.clone(),
             &crypto_config,
         )));
+
+        TransactionGenerator::start(
+            tx_sender_for_generator,
+            authority,
+            client_parameters,
+            metrics.clone(),
+        );
+
         let core = Core::open(
             block_handler,
             authority,
@@ -233,12 +241,6 @@ impl Validator {
             }
         }
 
-        TransactionGenerator::start(
-            tx_sender_for_generator,
-            authority,
-            client_parameters,
-            metrics.clone(),
-        );
 
         tracing::info!("Validator {authority} listening on {network_address}");
         tracing::info!("Validator {authority} exposing metrics on {metrics_address}");

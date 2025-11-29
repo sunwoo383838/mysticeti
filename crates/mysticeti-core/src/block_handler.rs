@@ -664,14 +664,12 @@ impl CommitObserver for CommitHandler {
         transaction_aggregator: &HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
     ) -> Vec<CommittedSubDag> {
         // 1. 함수 진입 및 처리할 리더 수 로깅
-        tracing::info!("➡️ [C-PATH] handle_commit: Start processing {} committed leaders.", committed_leaders.len());
 
         let committed = self
             .commit_interpreter
             .handle_commit(block_store, committed_leaders);
 
         // 2. 커밋 인터프리터 결과 로깅
-        tracing::info!("✅ [C-PATH] Commit interpreter returned {} finalized SubDag(s).", committed.len());
 
         let mut total_finalized_txs = 0;
 
@@ -679,13 +677,11 @@ impl CommitObserver for CommitHandler {
             self.committed_leaders.push(commit.anchor);
 
             // 3. 서브 DAG 앵커 로깅
-            tracing::info!("⚓ [C-PATH] Processing SubDag anchored at block: {}", commit.anchor);
 
             let mut subdag_tx_count = 0;
 
             for block in &commit.blocks {
                 // 4. 서브 DAG 내 블록 및 트랜잭션 수 로깅
-                tracing::info!("📦 [C-PATH] Processing block {} in SubDag", block.reference());
 
                 for (locator, _transaction) in block.shared_transactions() {
 
@@ -698,7 +694,6 @@ impl CommitObserver for CommitHandler {
                     // 🌟 [수정 5] C-Path Fallback 로직 분기
                     let should_finalize = if self.enable_block_fpc {
                         // [전략 1: Block Level FPC]
-                        tracing::debug!("💡 [C-PATH] Strategy: Block FPC enabled. Tx {} assumed valid.", locator);
                         true
                     } else {
                         // [전략 2: Transaction Level FPC]
@@ -706,24 +701,20 @@ impl CommitObserver for CommitHandler {
                             if let Some(stake_agg) = block_aggs.get(&locator) {
                                 let is_quorum = stake_agg.is_quorum(&self.committee);
                                 if is_quorum {
-                                    tracing::debug!("👍 [C-PATH] Strategy: Tx FPC (Fallback). Quorum met for {}", locator);
                                 }
                                 is_quorum
                             } else {
                                 // 투표 정보 없음 (Reject)
-                                tracing::debug!("❌ [C-PATH] Strategy: Tx FPC (Fallback). No vote info found for {}", locator);
                                 false
                             }
                         } else {
                             // 블록 정보 없음 (이 경우는 거의 없어야 함)
-                            tracing::debug!("❌ [C-PATH] Strategy: Tx FPC (Fallback). No aggregator info for block {}", block.reference());
                             false
                         }
                     };
 
                     if should_finalize {
                         // 5. C-Path 최종 확정 성공 로깅 (기존 warn -> info로 변경하여 Commit Metric으로 사용)
-                        tracing::info!("🎉 [C-PATH] FALLBACK SUCCESS: Finalizing transaction {}", locator);
                         // is_fpc = false (C-Path에 의한 커밋임을 표시)
                         self.write_finalized_vote(locator, block_store, false);
                         total_finalized_txs += 1;
@@ -731,12 +722,10 @@ impl CommitObserver for CommitHandler {
                     } else {
                         // 6. 최종 확정 실패 및 스킵 로깅 (enable_block_fpc=false일 때만 의미 있음)
                         if !self.enable_block_fpc {
-                            tracing::info!("🚫 [C-PATH] FALLBACK FAILED: Skipping rejected transaction {}", locator);
                         }
                     }
                 }
             }
-            tracing::info!("📊 [C-PATH] SubDag anchored at {} finalized {} transactions.", commit.anchor, subdag_tx_count);
         }
 
         // 7. 최종 집계 결과 로깅
