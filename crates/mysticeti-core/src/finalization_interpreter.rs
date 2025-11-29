@@ -150,6 +150,24 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
                 tracing::info!("🚀 [FPC] L2 FINALIZED Block {}! Starting commit...", target_block_ref);
 
                 if let Some(target_block) = self.block_store.get_block(target_block_ref) {
+                    let stmt_count = target_block.statements().len();
+                    let share_count = target_block.shared_transactions().count();
+
+                    tracing::info!(
+                    "🧐 [Inspect] Block {} content: Total Statements={}, Shared Txs={}",
+                    target_block_ref, stmt_count, share_count
+                );
+                    // 만약 트랜잭션이 하나라도 있다면 샘플 출력
+                    if share_count > 0 {
+                        tracing::info!("   -> First Tx found in block.");
+                    } else {
+                        tracing::warn!("   -> ⚠️ WARNING: Block is EMPTY (No 'Share' statements). It implies no transactions.");
+
+                        // (선택) Statements 타입 확인 (Vote만 들어있는지 확인)
+                        for (i, stmt) in target_block.statements().iter().take(5).enumerate() {
+                            tracing::info!("      Stmt[{}]: {:?}", i, stmt); // BaseStatement는 Debug 구현되어 있음
+                        }
+                    }
                     let mut committed_count = 0;
                     for (locator, _tx) in target_block.shared_transactions() {
                         if !self.ledger_writer.is_vote_finalized(&locator) {
