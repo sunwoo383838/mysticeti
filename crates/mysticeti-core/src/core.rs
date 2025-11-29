@@ -242,7 +242,6 @@ impl<H: BlockHandler> Core<H> {
             }
 
             result_blocks.push(block.clone());
-
             blocks_for_handler.push((block, check_individual));
         }
 

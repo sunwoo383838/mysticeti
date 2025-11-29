@@ -112,8 +112,6 @@ impl Validator {
             committee.clone(),
             commit_handler, // ✅ 소유권 이동
             metrics.clone(),
-            block_handler.transaction_time.clone(),
-            public_config.parameters.enable_block_fpc,
         );
 
         let dkg_complete_notify = Arc::new(Notify::new());

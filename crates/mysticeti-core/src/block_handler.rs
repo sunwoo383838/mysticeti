@@ -134,7 +134,6 @@ impl RealBlockHandler {
         transaction: &Transaction,
         current_timestamp: &Duration,
     ) {
-        // Record inter-block latency.
         if let Some(instant) = block_creation {
             let latency = instant.elapsed();
             self.metrics.transaction_certified_latency.observe(latency);
@@ -144,17 +143,14 @@ impl RealBlockHandler {
                 .observe(latency.as_secs_f64());
         }
 
-        // Record end-to-end latency.
         let tx_submission_timestamp = TransactionGenerator::extract_timestamp(transaction);
         let latency = current_timestamp.saturating_sub(tx_submission_timestamp);
         let square_latency = latency.as_secs_f64().powf(2.0);
-        self.metrics
-            .latency_s
-            .with_label_values(&["owned"])
+        self.metrics.latency_breakdown
+            .with_label_values(&["4_certified"])
             .observe(latency.as_secs_f64());
-        self.metrics
-            .latency_squared_s
-            .with_label_values(&["owned"])
+        self.metrics.latency_breakdown_squared_s
+            .with_label_values(&["4_certified"])
             .inc_by(square_latency);
     }
 }
@@ -335,22 +331,22 @@ impl BlockHandler for RealBlockHandler {
         self.pending_transactions -= block.shared_transactions().count();
         let mut transaction_time = self.transaction_time.lock();
 
-        // [Latency 3] Batching Time Calculation
-        // Pre-Consensus Total = Block Time - Tx Creation Time
         let block_time = runtime::timestamp_utc();
 
         for (locator, tx) in block.shared_transactions() {
             transaction_time.insert(locator, TimeInstant::now());
 
             let tx_time = Duration::from_millis(tx.timestamp);
-            let pre_consensus_latency = block_time.saturating_sub(tx_time);
+            let latency = block_time.saturating_sub(tx_time);
+            let square_latency = latency.as_secs_f64().powf(2.0);
 
-            self.metrics.latency_breakdown_pre_consensus
-                .with_label_values(&["shared"])
-                .observe(pre_consensus_latency.as_secs_f64());
-            self.metrics.latency_breakdown_pre_consensus_squared_s
-                .with_label_values(&["shared"])
-                .inc_by(pre_consensus_latency.as_secs_f64().powi(2));
+
+            self.metrics.latency_breakdown
+                .with_label_values(&["3_included"])
+                .observe(latency.as_secs_f64());
+            self.metrics.latency_breakdown_squared_s
+                .with_label_values(&["3_included"])
+                .inc_by(square_latency);
         }
         if !self.consensus_only {
             for range in block.shared_ranges() {
@@ -561,29 +557,16 @@ impl CommitHandler {
         transaction: &Transaction,
         is_fpc: bool,
     ) {
-        // Record inter-block latency.
         if let Some(instant) = block_creation {
             let latency = instant.elapsed();
-            // FPC로 최종화되었는지, C-Path로 최종화되었는지 확인
-            // (여기서는 block_creation 시간을 기준으로 대략적으로 구분)
-            // TODO: FPC/C-Path를 명확히 구분하여 메트릭을 기록하려면
-            // write_finalized_vote에 'is_fpc: bool' 플래그를 추가해야 합니다.
             self.metrics.transaction_committed_latency.observe(latency);
             self.metrics
                 .inter_block_latency_s
                 .with_label_values(&["shared"])
                 .observe(latency.as_secs_f64());
-
-            // [Latency 5] Finalization (Consensus) Time
-            // Block Creation -> Commit
-            let path_type = if is_fpc { "fpc" } else { "c" };
-            self.metrics.latency_breakdown_5_commit
-                .with_label_values(&["shared", path_type])
-                .observe(latency.as_secs_f64());
-            self.metrics.latency_breakdown_5_commit_squared_s
-                .with_label_values(&["shared", path_type])
-                .inc_by(latency.as_secs_f64().powi(2));
         }
+
+        let path_type = if is_fpc { "fpc" } else { "c" };
 
         // Record benchmark start time.
         let time_from_start = self.start_time.elapsed();
@@ -592,19 +575,19 @@ impl CommitHandler {
             self.metrics.benchmark_duration.inc_by(delta);
         }
 
-        // Record end-to-end latency. The first 8 bytes of the transaction are the timestamp of the
-        // transaction submission.
         let tx_submission_timestamp = TransactionGenerator::extract_timestamp(transaction);
         let latency = current_timestamp.saturating_sub(tx_submission_timestamp);
         let square_latency = latency.as_secs_f64().powf(2.0);
         self.metrics
             .latency_s
-            .with_label_values(&["shared"])
+            .with_label_values(&[path_type])
             .observe(latency.as_secs_f64());
         self.metrics
             .latency_squared_s
-            .with_label_values(&["shared"])
+            .with_label_values(&[path_type])
             .inc_by(square_latency);
+        
+        tracing::info!("metrics update");
     }
 }
 

@@ -266,8 +266,7 @@ impl ProtocolMetrics for MysticetiProtocol {
                 // Scrape both the node metrics (via localhost) and the node exporter metrics (port 9200)
                 (
                     instance,
-                    format!("curl -s http://127.0.0.1:{port_and_route} && curl -s http://localhost:9200/metrics")
-                )
+                    format!("curl -s http://127.0.0.1:{port_and_route} && curl -s http://localhost:9200/metrics")                )
             })
             .collect()
     }

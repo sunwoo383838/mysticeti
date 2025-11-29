@@ -2,19 +2,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use parking_lot::Mutex; // BlockHandler와 맞춤 (tokio::sync::Mutex일 수도 있으니 실제 코드 확인 필요)
 
-use crate::{
-    block_handler::LedgerWriter,
-    block_store::BlockStore,
-    committee::{Committee, QuorumThreshold, StakeAggregator},
-    data::Data,
-    metrics::Metrics, // 🌟 추가
-    runtime::TimeInstant, // 🌟 추가
-    types::{
-        AuthorityIndex, BaseStatement, BlockReference, StatementBlock, TransactionLocator, Vote,
-    },
-};
+use crate::{block_handler::LedgerWriter, block_store::BlockStore, committee::{Committee, QuorumThreshold, StakeAggregator}, data::Data, metrics::Metrics, runtime, runtime::TimeInstant, types::{
+    AuthorityIndex, BaseStatement, BlockReference, StatementBlock, TransactionLocator, Vote,
+}};
+use crate::transactions_generator::TransactionGenerator;
+use crate::types::Transaction;
 
 pub struct FinalizationInterpreter<'a, L: LedgerWriter> {
     transaction_aggregator: &'a mut HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
@@ -30,7 +25,6 @@ pub struct FinalizationInterpreter<'a, L: LedgerWriter> {
 
     // 🌟 [추가된 필드]
     metrics: Arc<Metrics>,
-    transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
 }
 
 impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
@@ -49,7 +43,6 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         block_level_fpc: bool,
         // 🌟 [추가된 인자]
         metrics: Arc<Metrics>,
-        transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
     ) -> Self {
         Self {
             transaction_aggregator,
@@ -61,7 +54,6 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
             block_store,
             block_level_fpc,
             metrics,        // 초기화
-            transaction_time, // 초기화
         }
     }
 
@@ -118,53 +110,33 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         let observer_aggs = self.block_aggregator.get_mut(observer_block.reference()).unwrap();
         let l1_state = observer_aggs.entry(target_block_ref).or_default();
 
-        // [L1] 메트릭 로직
-        let already_certified = l1_state.is_quorum(&self.committee);
+        // [수정] L1 상태(votes) 업데이트만 수행 (L2 진입 조건 확인용)
         l1_state.add(voter, &self.committee);
+
+        // L1 쿼럼 달성 여부 확인 (L2 로직의 트리거로 사용)
         let current_is_quorum = l1_state.is_quorum(&self.committee);
 
-        // [최적화 1] 락 획득을 루프 밖으로 이동 (Batch 처리)
-        // 이번 투표로 L1 인증이 완료된 경우에만 실행
-        if !already_certified && current_is_quorum {
-            if let Some(target_block) = self.block_store.get_block(target_block_ref) {
-                // 락을 여기서 한 번만 획득
-                let time_guard = self.transaction_time.lock();
+        // ❌ [삭제됨] L1 인증 시점 메트릭 업데이트 로직 제거
+        // if !already_certified && current_is_quorum { ... }
 
-                for (locator, _tx) in target_block.shared_transactions() {
-                    if let Some(start_time) = time_guard.get(&locator) {
-                        let latency = start_time.elapsed();
-                        self.metrics.latency_breakdown_4_cert
-                            .with_label_values(&["shared"])
-                            .observe(latency.as_secs_f64());
-                        self.metrics.latency_breakdown_4_cert_squared_s
-                            .with_label_values(&["shared"])
-                            .inc_by(latency.as_secs_f64().powi(2));
-                    }
-                }
-                // 루프 종료 후 락 자동 해제
-            }
-        }
-
-        // --- L2: 인증서 집계 ---
+        // --- L2: 인증서 집계 및 확정 ---
         if current_is_quorum {
             let l2_state = self.block_certificate_aggregator.entry(target_block_ref).or_default();
 
-            // [최적화 2] L2 중복 실행 방지 (Edge Trigger)
-            // 투표 반영 전 상태
+            // [최적화] L2 중복 실행 방지 (Edge Trigger)
             let l2_already_finalized = l2_state.is_quorum(&self.committee);
 
-            // 투표 반영
             l2_state.add(observer_block.author(), &self.committee);
 
-            // 투표 반영 후 상태
             let l2_now_finalized = l2_state.is_quorum(&self.committee);
 
-            // "이전에 확정 안 됨" && "지금 확정 됨" 인 경우에만 실행
+            // "이전에 확정 안 됨" && "지금 확정 됨" 인 경우에만 커밋 수행
             if !l2_already_finalized && l2_now_finalized {
                 if let Some(target_block) = self.block_store.get_block(target_block_ref) {
                     tracing::debug!("FPC-BLOCK: Finalized block {} (all txs)", target_block_ref);
                     for (locator, _tx) in target_block.shared_transactions() {
                         if !self.ledger_writer.is_vote_finalized(&locator) {
+                            // LedgerWriter(CommitHandler)가 내부적으로 Commit 메트릭을 기록함
                             self.ledger_writer.write_finalized_vote(locator, self.block_store, true);
                         }
                     }
@@ -234,32 +206,20 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
 
         let state = block_transaction_aggregator.entry(*transaction).or_default();
 
-        let already_certified = state.is_quorum(&self.committee);
+        // [수정] L1 상태 업데이트만 수행
         state.add(tx_voter, &self.committee);
+
+        // L1 쿼럼 확인
         let current_is_quorum = state.is_quorum(&self.committee);
 
-        // [최적화 1 적용] 단일 건이라 루프는 없지만, 락 획득은 조건부로 수행하여 오버헤드 감소
-        if !already_certified && current_is_quorum {
-            // 락은 값을 읽어야 할 때만 획득
-            let guard = self.transaction_time.lock();
-            if let Some(start_time) = guard.get(transaction) {
-                let latency = start_time.elapsed();
-                self.metrics.latency_breakdown_4_cert
-                    .with_label_values(&["shared"])
-                    .observe(latency.as_secs_f64());
-                self.metrics.latency_breakdown_4_cert_squared_s
-                    .with_label_values(&["shared"])
-                    .inc_by(latency.as_secs_f64().powi(2));
-            }
-        }
+        // ❌ [삭제됨] L1 인증 시점 메트릭 업데이트 로직 제거
+        // if !already_certified && current_is_quorum { ... }
 
         if !current_is_quorum || block.epoch_changed() {
             return;
         }
 
-        // L2 처리 (여기도 마찬가지로 Edge Trigger 적용 가능하나,
-        // 트랜잭션 단위는 ledger_writer.is_vote_finalized가 상단에 있어 부하가 덜함.
-        // 하지만 일관성을 위해 적용 권장)
+        // --- L2: 인증서 집계 및 확정 ---
         let cert_aggregator = self.certificate_aggregator.entry(*transaction).or_default();
 
         let l2_was_quorum = cert_aggregator.is_quorum(&self.committee);
@@ -272,3 +232,4 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         }
     }
 }
+

@@ -40,8 +40,8 @@ const LATENCY_SEC_BUCKETS: &[f64] = &[
 ];
 
 // Latency Breakdown Buckets (더 정밀한 마이크로초/밀리초 단위 측정용)
-const BREAKDOWN_SEC_BUCKETS: &[f64] = &[
-    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+const UNIFIED_LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0
 ];
 
 pub const BENCHMARK_DURATION: &str = "benchmark_duration";
@@ -57,23 +57,8 @@ pub struct Metrics {
     pub leader_timeout_total: IntCounter,
     pub inter_block_latency_s: HistogramVec,
 
-    // --- [Latency Breakdown Metrics] ---
-    // 1. Queueing (Tx Creation -> Verify Start)
-    pub latency_breakdown_1_queue: HistogramVec,
-    // 2. Verification (Verify Start -> Verify End)
-    pub latency_breakdown_2_verify: HistogramVec,
-    // 3. Pre-Consensus Total (Tx Creation -> Block Creation)
-    //    Batching = This - (Queue + Verify)
-    pub latency_breakdown_pre_consensus: HistogramVec,
-    // 4. Certification (Block Creation -> 2f+1 Votes)
-    pub latency_breakdown_4_cert: HistogramVec,
-    pub latency_breakdown_5_commit: HistogramVec,
-
-    pub latency_breakdown_1_queue_squared_s: CounterVec,
-    pub latency_breakdown_2_verify_squared_s: CounterVec,
-    pub latency_breakdown_pre_consensus_squared_s: CounterVec,
-    pub latency_breakdown_4_cert_squared_s: CounterVec,
-    pub latency_breakdown_5_commit_squared_s: CounterVec,
+    pub latency_breakdown: HistogramVec,
+    pub latency_breakdown_squared_s: CounterVec,
 
     // 🌟 [추가 추천] 투표 유형(Accept/Reject) 카운터
     // 검증 실패 비율을 보기 위해 필수적입니다.
@@ -262,41 +247,6 @@ impl Metrics {
                 registry,
             ).unwrap(),
 
-            latency_breakdown_1_queue_squared_s: register_counter_vec_with_registry!(
-                "latency_breakdown_1_queue_squared_s",
-                "Squared sum of queueing latency",
-                &["workload"],
-                registry,
-            ).unwrap(),
-
-            latency_breakdown_2_verify_squared_s: register_counter_vec_with_registry!(
-                "latency_breakdown_2_verify_squared_s",
-                "Squared sum of verify latency",
-                &["workload"],
-                registry,
-            ).unwrap(),
-
-            latency_breakdown_pre_consensus_squared_s: register_counter_vec_with_registry!(
-                "latency_breakdown_pre_consensus_squared_s",
-                "Squared sum of pre-consensus latency",
-                &["workload"],
-                registry,
-            ).unwrap(),
-
-            latency_breakdown_4_cert_squared_s: register_counter_vec_with_registry!(
-                "latency_breakdown_4_cert_squared_s",
-                "Squared sum of certification latency",
-                &["workload"],
-                registry,
-            ).unwrap(),
-
-            latency_breakdown_5_commit_squared_s: register_counter_vec_with_registry!(
-                "latency_breakdown_5_commit_squared_s",
-                "Squared sum of commit latency",
-                &["workload", "path_type"],
-                registry,
-            ).unwrap(),
-
             // 🌟 [추가] 투표 유형 카운터
             transaction_votes_total: register_int_counter_vec_with_registry!(
                 "transaction_votes_total",
@@ -305,41 +255,18 @@ impl Metrics {
                 registry,
             ).unwrap(),
 
-            // [New Breakdown Metrics]
-            latency_breakdown_1_queue: register_histogram_vec_with_registry!(
-                "latency_breakdown_1_queue",
-                "Time from Tx creation to verification start (Queueing)",
-                &["workload"],
-                BREAKDOWN_SEC_BUCKETS.to_vec(),
-                registry,
-            ).unwrap(),
-            latency_breakdown_2_verify: register_histogram_vec_with_registry!(
-                "latency_breakdown_2_verify",
-                "Time taken for cryptographic verification (CPU)",
-                &["workload"],
-                BREAKDOWN_SEC_BUCKETS.to_vec(),
-                registry,
-            ).unwrap(),
-            latency_breakdown_pre_consensus: register_histogram_vec_with_registry!(
-                "latency_breakdown_pre_consensus",
-                "Total time from Tx creation to Block inclusion",
-                &["workload"],
-                LATENCY_SEC_BUCKETS.to_vec(),
-                registry,
-            ).unwrap(),
-            latency_breakdown_4_cert: register_histogram_vec_with_registry!(
-                "latency_breakdown_4_cert",
-                "Time from Block creation to L1 Certification (2f+1 votes)",
-                &["workload"],
-                LATENCY_SEC_BUCKETS.to_vec(),
+            latency_breakdown: register_histogram_vec_with_registry!(
+                "latency_breakdown",
+                "Cumulative latency breakdown from Tx creation (0-x) by stage",
+                &["stage"], // stage: 1_queue, ..., 5_committed_c/fpc
+                UNIFIED_LATENCY_BUCKETS.to_vec(),
                 registry,
             ).unwrap(),
 
-            latency_breakdown_5_commit: register_histogram_vec_with_registry!(
-                "latency_breakdown_5_commit", // ✅ 수정됨
-                "Time from Block creation to Commit", // (선택사항) 설명도 "Commit"으로 수정하면 좋습니다
-                &["workload", "path_type"],
-                LATENCY_SEC_BUCKETS.to_vec(),
+            latency_breakdown_squared_s: register_counter_vec_with_registry!(
+                "latency_breakdown_squared_s",
+                "Squared sum of latency breakdown by stage",
+                &["stage"],
                 registry,
             ).unwrap(),
 

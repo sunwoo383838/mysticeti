@@ -35,7 +35,6 @@ pub struct FpcService {
 
     block_level_fpc: bool,
     metrics: Arc<Metrics>,
-    transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
     receiver: mpsc::Receiver<FpcMessage>,
 }
 
@@ -45,7 +44,6 @@ impl FpcService {
         committee: Arc<Committee>,
         commit_handler: CommitHandler, // 소유권 전달 받음
         metrics: Arc<Metrics>,
-        transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
         block_level_fpc: bool,
     ) -> (mpsc::Sender<FpcMessage>, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(200_000);
@@ -60,7 +58,6 @@ impl FpcService {
             block_certificate_aggregator: HashMap::new(),
             block_level_fpc,
             metrics,
-            transaction_time,
             receiver,
         };
 
@@ -100,15 +97,12 @@ impl FpcService {
             &mut self.block_certificate_aggregator,
             self.block_level_fpc,
             self.metrics.clone(),
-            self.transaction_time.clone(),
         );
         interpreter.process_block(&block);
     }
 
     // ✅ C-Path 처리 로직 (DB I/O 포함)
     fn process_committed_leaders(&mut self, committed_leaders: Vec<Data<StatementBlock>>) {
-        // CommitHandler에게 위임 -> 내부적으로 Linearizer 실행 및 DB 쓰기(write_finalized_vote) 수행
-        // FPC Aggregator 정보도 함께 넘겨주어 중복 처리를 방지할 수 있음
         self.commit_handler.handle_commit(
             &self.block_store,
             committed_leaders,
