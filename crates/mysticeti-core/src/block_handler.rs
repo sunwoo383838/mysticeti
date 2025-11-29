@@ -324,6 +324,22 @@ impl BlockHandler for RealBlockHandler {
             .block_handler_pending_certificates
             .set(self.transaction_votes.len() as i64);
 
+        if !response.is_empty() {
+            tracing::info!("📦 [BlockHandler] Generated response with {} statements", response.len());
+
+            // 너무 많으면 앞부분만 출력 (예: 5개)
+            for (i, stmt) in response.iter().take(5).enumerate() {
+                // BaseStatement는 Debug 트레이트가 구현되어 있어 {:?}로 출력 가능
+                tracing::info!("   -> Stmt[{}]: {:?}", i, stmt);
+            }
+            if response.len() > 5 {
+                tracing::info!("   -> ... and {} more statements", response.len() - 5);
+            }
+        } else if require_response {
+            // 응답이 필요한데(require_response=true) 내용이 비어있다면,
+            // 멤풀에 트랜잭션이 없거나 검증에 실패한 것일 수 있음
+            tracing::debug!("💤 [BlockHandler] Required response but generated EMPTY response. (Mempool empty?)");
+        }
         response
     }
 
