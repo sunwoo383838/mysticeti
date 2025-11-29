@@ -47,7 +47,7 @@ impl FpcService {
         block_level_fpc: bool,
     ) -> (mpsc::Sender<FpcMessage>, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(200_000);
-
+        tracing::info!("🚀 [FpcService] Spawn called. Initializing service struct...");
         let service = Self {
             block_store,
             committee,
@@ -60,9 +60,11 @@ impl FpcService {
             metrics,
             receiver,
         };
-
+        tracing::info!("🚀 [FpcService] Service initialized. Spawning Tokio task...");
         let handle = tokio::spawn(async move {
+            tracing::info!("✅ [FpcService] Tokio task started execution.");
             service.run().await;
+            tracing::warn!("⚠️ [FpcService] Tokio task finished (Loop exited).");
         });
 
         (sender, handle)

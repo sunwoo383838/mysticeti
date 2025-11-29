@@ -115,6 +115,9 @@ impl Validator {
             public_config.parameters.enable_block_fpc
         );
 
+        tracing::info!("fpc service 생성");
+
+
         let dkg_complete_notify = Arc::new(Notify::new());
         let my_secret_share = Arc::new(Mutex::new(Option::<Fr>::None));
 
