@@ -593,6 +593,7 @@ impl CommitHandler {
 
 impl LedgerWriter for CommitHandler {
     fn write_finalized_vote(&mut self, vote: TransactionLocator, block_store: &BlockStore, is_fpc: bool) {
+        tracing::info!("finalized vote");
         if !self.finalized_cache.insert(vote) {
             return;
         }
@@ -646,61 +647,84 @@ impl CommitObserver for CommitHandler {
         committed_leaders: Vec<Data<StatementBlock>>,
         transaction_aggregator: &HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
     ) -> Vec<CommittedSubDag> {
+        // 1. 함수 진입 및 처리할 리더 수 로깅
+        tracing::info!("➡️ [C-PATH] handle_commit: Start processing {} committed leaders.", committed_leaders.len());
 
-        // C-Path가 순서 매긴 블록 목록을 가져옴
         let committed = self
             .commit_interpreter
             .handle_commit(block_store, committed_leaders);
 
+        // 2. 커밋 인터프리터 결과 로깅
+        tracing::info!("✅ [C-PATH] Commit interpreter returned {} finalized SubDag(s).", committed.len());
+
+        let mut total_finalized_txs = 0;
+
         for commit in &committed {
             self.committed_leaders.push(commit.anchor);
 
+            // 3. 서브 DAG 앵커 로깅
+            tracing::info!("⚓ [C-PATH] Processing SubDag anchored at block: {}", commit.anchor);
+
+            let mut subdag_tx_count = 0;
+
             for block in &commit.blocks {
+                // 4. 서브 DAG 내 블록 및 트랜잭션 수 로깅
+                tracing::info!("📦 [C-PATH] Processing block {} in SubDag", block.reference());
+
                 for (locator, _transaction) in block.shared_transactions() {
 
                     // 1. 이미 FPC로 최종화된 트랜잭션은 스킵 (중복 실행 방지)
                     if self.is_vote_finalized(&locator) {
+                        tracing::debug!("⏩ [C-PATH] Skipping already FPC-finalized transaction: {}", locator);
                         continue;
                     }
 
                     // 🌟 [수정 5] C-Path Fallback 로직 분기
                     let should_finalize = if self.enable_block_fpc {
                         // [전략 1: Block Level FPC]
-                        // C-Path가 커밋했다면, 해당 블록은 NetSync에서 배치 검증을 통과한 것임.
-                        // 따라서 블록 내 모든 트랜잭션을 안전하게 최종화.
+                        tracing::debug!("💡 [C-PATH] Strategy: Block FPC enabled. Tx {} assumed valid.", locator);
                         true
                     } else {
                         // [전략 2: Transaction Level FPC]
-                        // C-Path가 커밋했더라도, 개별 트랜잭션의 유효성은 보장되지 않음 (Reject 됐을 수 있음).
-                        // 따라서 "L1 인증서(2f+1 Vote)"가 존재하는지 확인해야 함.
-
-                        // 해당 블록의 투표 맵 조회
                         if let Some(block_aggs) = transaction_aggregator.get(block.reference()) {
-                            // 해당 트랜잭션의 투표 집계 조회
                             if let Some(stake_agg) = block_aggs.get(&locator) {
-                                // 2f+1 쿼럼 확인 (StakeAggregator에 is_quorum 메서드 필요)
-                                stake_agg.is_quorum(&self.committee)
+                                let is_quorum = stake_agg.is_quorum(&self.committee);
+                                if is_quorum {
+                                    tracing::debug!("👍 [C-PATH] Strategy: Tx FPC (Fallback). Quorum met for {}", locator);
+                                }
+                                is_quorum
                             } else {
-                                false // 투표 정보 없음 (Reject 됨)
+                                // 투표 정보 없음 (Reject)
+                                tracing::debug!("❌ [C-PATH] Strategy: Tx FPC (Fallback). No vote info found for {}", locator);
+                                false
                             }
                         } else {
-                            false // 블록 정보 없음
+                            // 블록 정보 없음 (이 경우는 거의 없어야 함)
+                            tracing::debug!("❌ [C-PATH] Strategy: Tx FPC (Fallback). No aggregator info for block {}", block.reference());
+                            false
                         }
                     };
 
                     if should_finalize {
-                        tracing::warn!("C-PATH FALLBACK: Finalizing transaction {}", locator);
+                        // 5. C-Path 최종 확정 성공 로깅 (기존 warn -> info로 변경하여 Commit Metric으로 사용)
+                        tracing::info!("🎉 [C-PATH] FALLBACK SUCCESS: Finalizing transaction {}", locator);
                         // is_fpc = false (C-Path에 의한 커밋임을 표시)
                         self.write_finalized_vote(locator, block_store, false);
+                        total_finalized_txs += 1;
+                        subdag_tx_count += 1;
                     } else {
-                        // [전략 2]에서 검증 실패로 인해 투표를 못 받은 트랜잭션은 여기서 최종적으로 버려짐
+                        // 6. 최종 확정 실패 및 스킵 로깅 (enable_block_fpc=false일 때만 의미 있음)
                         if !self.enable_block_fpc {
-                            tracing::debug!("Skipping invalid/unsupported tx {} in committed block", locator);
+                            tracing::info!("🚫 [C-PATH] FALLBACK FAILED: Skipping rejected transaction {}", locator);
                         }
                     }
                 }
             }
+            tracing::info!("📊 [C-PATH] SubDag anchored at {} finalized {} transactions.", commit.anchor, subdag_tx_count);
         }
+
+        // 7. 최종 집계 결과 로깅
+        tracing::info!("🏁 [C-PATH] handle_commit finished. Total transactions finalized: {}.", total_finalized_txs);
 
         committed
     }

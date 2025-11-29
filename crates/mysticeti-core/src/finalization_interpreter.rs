@@ -67,36 +67,45 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
 
     // 🌟 [Mode 1] 블록 단위 FPC - 메트릭 기록 로직 추가
     fn process_block_level(&mut self, block: &Data<StatementBlock>) {
-        tracing::info!("블록처리");
         if self.block_aggregator.contains_key(block.reference()) {
             return;
         }
         self.block_aggregator.insert(*block.reference(), HashMap::new());
 
+        // 🔍 [로그 1] 블록 처리 시작 (너무 많으면 trace로 변경)
+        // FPC가 해당 블록을 인지했는지 확인
+        tracing::trace!("Processing block for FPC: {}", block.reference());
+
         for parent_ref in block.includes() {
             if let Some(parent_block) = self.block_store.get_block(*parent_ref) {
                 self.process_block_level(&parent_block);
 
-                // [최적화 3] HashMap 전체 Clone 제거
-                // 필요한 데이터(Target Block Reference, Voters)만 벡터로 수집
-                // StakeAggregator 내부 구조가 가볍다면(비트맵 등) 이 방식이 훨씬 효율적입니다.
                 let votes_to_cast: Vec<_> = self.block_aggregator
                     .get(parent_ref)
                     .unwrap()
                     .iter()
                     .flat_map(|(target_ref, agg)| {
-                        // agg.voters()가 참조를 반환한다면 여기서 복사하거나 collect 해야 함
                         agg.voters().map(move |voter| (*target_ref, voter))
                     })
                     .collect();
 
-                // 수집된 투표 적용 (self를 mut로 빌려야 하므로 루프 분리)
+                // 🔍 [로그 2] 투표 계승(Vote Inheritance) 확인
+                // 부모로부터 투표를 물려받지 못하면 L1 인증이 전파되지 않음
+                // if !votes_to_cast.is_empty() {
+                //     tracing::trace!("Inherited {} votes from parent {}", votes_to_cast.len(), parent_ref);
+                // }
+
                 for (target_ref, voter) in votes_to_cast {
                     self.vote_block_level(block, target_ref, voter);
                 }
+            } else {
+                // 🚨 [로그 3] 부모 블록 누락 경고 (가장 흔한 실패 원인)
+                // 이 로그가 뜨면 FPC가 Core보다 빨라서 데이터를 못 찾고 있거나, 동기화 문제입니다.
+                tracing::warn!("⚠️ [FPC] Missing parent block {} required by {}", parent_ref, block.reference());
             }
         }
 
+        // 자기 자신의 투표 처리
         for parent_ref in block.includes() {
             self.vote_block_level(block, *parent_ref, block.author());
         }
@@ -111,36 +120,52 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         let observer_aggs = self.block_aggregator.get_mut(observer_block.reference()).unwrap();
         let l1_state = observer_aggs.entry(target_block_ref).or_default();
 
-        // [수정] L1 상태(votes) 업데이트만 수행 (L2 진입 조건 확인용)
+        // 1. L1 투표 추가
+        let l1_was_quorum = l1_state.is_quorum(&self.committee);
         l1_state.add(voter, &self.committee);
+        let l1_is_quorum = l1_state.is_quorum(&self.committee);
 
-        // L1 쿼럼 달성 여부 확인 (L2 로직의 트리거로 사용)
-        let current_is_quorum = l1_state.is_quorum(&self.committee);
+        // 🔍 [로그 4] L1 인증(Certification) 달성 순간
+        if !l1_was_quorum && l1_is_quorum {
+            tracing::debug!("🎉 [FPC] L1 Certified block {} (triggered by {})", target_block_ref, observer_block.reference());
+        }
 
-        // ❌ [삭제됨] L1 인증 시점 메트릭 업데이트 로직 제거
-        // if !already_certified && current_is_quorum { ... }
-
-        // --- L2: 인증서 집계 및 확정 ---
-        if current_is_quorum {
+        // 2. L2 진입 (L1 인증이 완료된 상태여야 함)
+        if l1_is_quorum {
             let l2_state = self.block_certificate_aggregator.entry(target_block_ref).or_default();
 
-            // [최적화] L2 중복 실행 방지 (Edge Trigger)
+            // Edge Trigger 확인을 위한 이전 상태 저장
             let l2_already_finalized = l2_state.is_quorum(&self.committee);
 
+            // L2 투표 추가 (Observer가 L1을 확인했음을 등록)
             l2_state.add(observer_block.author(), &self.committee);
 
             let l2_now_finalized = l2_state.is_quorum(&self.committee);
 
-            // "이전에 확정 안 됨" && "지금 확정 됨" 인 경우에만 커밋 수행
+            // 🔍 [로그 5] L2 투표 진행 상황 (디버깅용, 너무 많으면 주석 처리)
+            // tracing::trace!("   -> L2 Vote for {}: New Stake Added. Quorum reached? {}", target_block_ref, l2_now_finalized);
+
+            // 3. L2 확정(Finalization) 및 커밋 수행
             if !l2_already_finalized && l2_now_finalized {
+                tracing::info!("🚀 [FPC] L2 FINALIZED Block {}! Starting commit...", target_block_ref);
+
                 if let Some(target_block) = self.block_store.get_block(target_block_ref) {
-                    tracing::debug!("FPC-BLOCK: Finalized block {} (all txs)", target_block_ref);
+                    let mut committed_count = 0;
                     for (locator, _tx) in target_block.shared_transactions() {
                         if !self.ledger_writer.is_vote_finalized(&locator) {
-                            // LedgerWriter(CommitHandler)가 내부적으로 Commit 메트릭을 기록함
                             self.ledger_writer.write_finalized_vote(locator, self.block_store, true);
+                            committed_count += 1;
                         }
                     }
+
+                    if committed_count > 0 {
+                        tracing::info!("✅ [FPC] Successfully committed {} txs from block {}", committed_count, target_block_ref);
+                    } else {
+                        tracing::info!("ℹ️ [FPC] Block {} finalized, but all txs were already processed.", target_block_ref);
+                    }
+                } else {
+                    // 🚨 [로그 6] 치명적 오류: 확정된 블록 본문을 찾을 수 없음
+                    tracing::error!("🔥 [FPC] CRITICAL: Finalized block {} not found in store!", target_block_ref);
                 }
             }
         }
