@@ -48,7 +48,7 @@ impl FpcService {
         transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
         block_level_fpc: bool,
     ) -> (mpsc::Sender<FpcMessage>, JoinHandle<()>) {
-        let (sender, receiver) = mpsc::channel(10_000);
+        let (sender, receiver) = mpsc::channel(200_000);
 
         let service = Self {
             block_store,

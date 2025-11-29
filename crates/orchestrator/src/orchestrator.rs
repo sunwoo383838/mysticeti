@@ -200,10 +200,6 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
             "echo \"source $HOME/.cargo/env\" | tee -a ~/.bashrc",
             "source $HOME/.cargo/env",
             "rustup default stable",
-            "git clone https://github.com/brendangregg/FlameGraph",
-            // 편의를 위해 홈 디렉토리로 스크립트 복사
-            "cp FlameGraph/*.pl ~/",
-            "chmod +x ~/*.pl",
             // Create the working directory.
             &format!("mkdir -p {working_dir}"),
             // Clone the repo.
@@ -713,16 +709,6 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
         }
         display::done();
 
-        let connection = self.ssh_manager.connect(nodes[0].ssh_address()).await?;
-        match connection.download("perf.svg") {
-            Ok(content) => {
-                let path = self.settings.results_dir.join("core_thread_profile.svg");
-                fs::write(&path, content).expect("Failed to save flamegraph");
-                display::action(format!("Saved FlameGraph to {}", path.display()));
-            },
-            Err(_) => display::warn("No flamegraph found (perf.svg)"),
-        }
-
         Ok(log_parsers
             .into_iter()
             .max()
@@ -836,62 +822,6 @@ impl<P: ProtocolCommands + ProtocolMetrics> Orchestrator<P> {
 
                 // Deploy the load generators.
                 self.run_clients(&parameters).await?;
-
-                if !nodes.is_empty() {
-                    let ssh_manager_profile = self.ssh_manager.clone();
-                    let target_node = nodes[0].clone(); // 0번 노드만 프로파일링
-
-                    // assets/flamegraph.sh 내용을 읽어서 준비 (로컬 파일)
-                    let flamegraph_script = fs::read_to_string("crates/orchestrator/assets/flamegraph.sh")
-                        .expect("Failed to read flamegraph.sh");
-
-                    tokio::spawn(async move {
-                        // 1. 안정화될 때까지 대기 (예: 60초)
-                        //    병목이 발생하는 시점(거대 블록 처리 중)을 포착해야 합니다.
-                        tokio::time::sleep(Duration::from_secs(60)).await;
-
-                        display::action("🔥 Starting CPU Profiling on Node 0 Core Thread");
-
-                        // 2. 스크립트 업로드
-                        let upload_cmd = format!("echo '{}' > ~/flamegraph.sh && chmod +x ~/flamegraph.sh", flamegraph_script);
-                        if let Err(e) = ssh_manager_profile.execute(std::iter::once(target_node.clone()), upload_cmd, CommandContext::default()).await {
-                            display::warn(format!("Failed to upload flamegraph script: {}", e));
-                            return;
-                        }
-
-                        // 3. Core 스레드 ID (TID) 찾기 및 프로파일링 실행
-                        //    Mysticeti 코드는 Core 스레드 이름을 "mysticeti-core"로 지정했습니다.
-                        let profile_cmd = "
-                # 메인 프로세스 PID 찾기
-                MAIN_PID=$(pgrep -f 'mysticeti run' | head -n 1)
-
-                # 메인 프로세스 하위의 'mysticeti-core' 스레드 ID(SPID) 찾기
-                # (ps -T 옵션으로 스레드 확인)
-                CORE_TID=$(ps -T -p $MAIN_PID -o spid,comm | grep 'mysticeti-core' | awk '{print $1}')
-
-                if [ -z \"$CORE_TID\" ]; then
-                    echo '❌ Core thread not found!'
-                    exit 1
-                fi
-
-                echo \"Found Core Thread TID: $CORE_TID. Starting perf...\"
-
-                # flamegraph.sh 실행 (인자로 TID 전달)
-                # 스크립트 내부: sudo perf record -F 99 -g -t $CORE_TID -- sleep 30
-                ./flamegraph.sh $CORE_TID
-            ";
-
-                        let context = CommandContext::new()
-                            .run_background("profiling".into()) // 백그라운드 실행
-                            .with_log_file("~/profiling.log".into());
-
-                        if let Err(e) = ssh_manager_profile.execute(std::iter::once(target_node.clone()), profile_cmd.to_string(), context).await {
-                            display::warn(format!("Failed to start profiling: {}", e));
-                        } else {
-                            display::status("Profiling started (30s duration)");
-                        }
-                    });
-                }
 
                 // 1. 실제 벤치마크 시간 (예: 3분)
                 let benchmark_duration = parameters.settings.benchmark_duration;
