@@ -76,6 +76,15 @@ pub struct Metrics {
     pub core_lock_enqueued: IntCounter,
     pub core_lock_dequeued: IntCounter,
 
+    pub fpc_block_util: IntCounter,
+    pub fpc_block_enqueued: IntCounter,
+    pub fpc_block_dequeued: IntCounter,
+
+    // [FPC Commit Processor용]
+    pub fpc_commit_util: IntCounter,
+    pub fpc_commit_enqueued: IntCounter,
+    pub fpc_commit_dequeued: IntCounter,
+
     pub block_handler_pending_certificates: IntGauge,
     pub block_handler_cleanup_util: IntCounter,
 
@@ -215,6 +224,38 @@ impl Metrics {
         };
 
         let metrics = Self {
+            fpc_block_util: register_int_counter_with_registry!(
+                "fpc_block_util",
+                "Utilization of FPC block processor",
+                registry,
+            ).unwrap(),
+            fpc_block_enqueued: register_int_counter_with_registry!(
+                "fpc_block_enqueued",
+                "Number of enqueued FPC block requests",
+                registry,
+            ).unwrap(),
+            fpc_block_dequeued: register_int_counter_with_registry!(
+                "fpc_block_dequeued",
+                "Number of dequeued FPC block requests",
+                registry,
+            ).unwrap(),
+
+            // 2. FPC Commit Metrics 초기화
+            fpc_commit_util: register_int_counter_with_registry!(
+                "fpc_commit_util",
+                "Utilization of FPC commit processor",
+                registry,
+            ).unwrap(),
+            fpc_commit_enqueued: register_int_counter_with_registry!(
+                "fpc_commit_enqueued",
+                "Number of enqueued FPC commit requests",
+                registry,
+            ).unwrap(),
+            fpc_commit_dequeued: register_int_counter_with_registry!(
+                "fpc_commit_dequeued",
+                "Number of dequeued FPC commit requests",
+                registry,
+            ).unwrap(),
             benchmark_duration: register_int_counter_with_registry!(
                 BENCHMARK_DURATION,
                 "Duration of the benchmark",

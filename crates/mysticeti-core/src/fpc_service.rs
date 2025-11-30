@@ -9,7 +9,7 @@ use crate::block_store::BlockStore;
 use crate::committee::{Committee, QuorumThreshold, StakeAggregator};
 use crate::data::Data;
 use crate::finalization_interpreter::FinalizationInterpreter;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, UtilizationTimerExt};
 use crate::syncer::CommitObserver;
 use crate::types::{BlockReference, StatementBlock, TransactionLocator};
 
@@ -20,16 +20,19 @@ pub struct FpcClient {
     block_sender: mpsc::Sender<Data<StatementBlock>>,
     commit_sender: mpsc::Sender<Vec<Data<StatementBlock>>>,
     locators_sender: mpsc::Sender<oneshot::Sender<Vec<TransactionLocator>>>,
+    metrics: Arc<Metrics>, // 🌟 추가됨
 }
 
 impl FpcClient {
     pub async fn send_block(&self, block: Data<StatementBlock>) {
+        self.metrics.fpc_block_enqueued.inc();
         if let Err(e) = self.block_sender.send(block).await {
             tracing::warn!("Failed to send block to FPC service: {:?}", e);
         }
     }
 
     pub async fn send_committed_leaders(&self, leaders: Vec<Data<StatementBlock>>) {
+        self.metrics.fpc_commit_enqueued.inc();
         if let Err(e) = self.commit_sender.send(leaders).await {
             tracing::error!("Failed to send committed leaders to FPC service: {:?}", e);
         }
@@ -97,7 +100,7 @@ impl FpcService {
             state,
             block_store,
             committee,
-            metrics,
+            metrics: metrics.clone(),
             block_level_fpc,
         };
 
@@ -111,6 +114,12 @@ impl FpcService {
         handles.push(tokio::spawn(async move {
             tracing::info!("✅ [FpcService] Block Processor task started.");
             while let Some(block) = block_rx.recv().await {
+                // 🌟 [적용] Dequeue 및 Utilization 측정
+                s1.metrics.fpc_block_dequeued.inc();
+                // 이 타이머(_timer)는 process_block_internal이 끝나고
+                // 루프의 이터레이션이 끝날 때 drop되면서 시간을 기록합니다.
+                let _timer = s1.metrics.fpc_block_util.utilization_timer();
+
                 s1.process_block_internal(block);
             }
             tracing::warn!("⚠️ [FpcService] Block Processor task stopped.");
@@ -122,6 +131,10 @@ impl FpcService {
         handles.push(tokio::spawn(async move {
             tracing::info!("✅ [FpcService] Commit Processor task started.");
             while let Some(leaders) = commit_rx.recv().await {
+                // 🌟 [적용] Dequeue 및 Utilization 측정
+                s2.metrics.fpc_commit_dequeued.inc();
+                let _timer = s2.metrics.fpc_commit_util.utilization_timer();
+
                 s2.process_committed_leaders(leaders);
             }
             tracing::warn!("⚠️ [FpcService] Commit Processor task stopped.");
@@ -140,6 +153,7 @@ impl FpcService {
             block_sender: block_tx,
             commit_sender: commit_tx,
             locators_sender: locators_tx,
+            metrics
         };
 
         (client, handles)

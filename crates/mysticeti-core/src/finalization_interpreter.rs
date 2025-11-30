@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::{
@@ -12,8 +11,6 @@ use crate::{
     committee::{Committee, QuorumThreshold, StakeAggregator},
     data::Data,
     metrics::Metrics,
-    runtime,
-    runtime::TimeInstant,
     types::{
         AuthorityIndex, BaseStatement, BlockReference, StatementBlock, TransactionLocator, Vote,
     },
@@ -33,7 +30,6 @@ pub struct FinalizationInterpreter<'a, L: LedgerWriter> {
     metrics: Arc<Metrics>,
 
     // --- GC / Pruning State (Shared State) ---
-    // FPCService가 관리하는 영구 상태를 참조로 받아옵니다.
     blocks_by_round: &'a mut HashMap<u64, Vec<BlockReference>>,
     highest_known_round: &'a mut u64,
 }
@@ -51,11 +47,8 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         certificate_aggregator: &'a mut HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>,
         block_aggregator: &'a mut HashMap<BlockReference, HashMap<BlockReference, StakeAggregator<QuorumThreshold>>>,
         block_certificate_aggregator: &'a mut HashMap<BlockReference, StakeAggregator<QuorumThreshold>>,
-
-        // 🌟 [신규 인자] GC 상태
         blocks_by_round: &'a mut HashMap<u64, Vec<BlockReference>>,
         highest_known_round: &'a mut u64,
-
         block_level_fpc: bool,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -101,14 +94,10 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         }
 
         // 3. 프루닝 임계값 설정 (최신 라운드 - 3)
-        // 3라운드 이전의 데이터는 더 이상 합의에 영향을 주지 않는다고 판단하여 삭제
+        // 안전 마진을 조금 더 줄 수도 있지만, 여기서는 제안대로 유지
         let prune_threshold = self.highest_known_round.saturating_sub(3);
 
         // 4. 임계값보다 오래된 라운드 데이터 삭제
-        // (한 번에 다 지우지 않고, 맵에 남아있는 '가장 오래된 라운드'부터 threshold까지 순차적으로 지우는 것이 안전하지만,
-        //  여기서는 retain을 사용하지 않고 인덱스 기반으로 효율적으로 삭제합니다.)
-
-        // 인덱스 맵에서 threshold 미만인 라운드 키들을 수집
         let rounds_to_prune: Vec<u64> = self.blocks_by_round.keys()
             .filter(|&r| *r < prune_threshold)
             .cloned()
@@ -117,26 +106,19 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         for r in rounds_to_prune {
             if let Some(block_refs) = self.blocks_by_round.remove(&r) {
                 for bref in block_refs {
-                    // [Block L1] 투표 집계 삭제
                     self.block_aggregator.remove(&bref);
-                    // [Block L2] 인증서 집계 삭제
                     self.block_certificate_aggregator.remove(&bref);
-
-                    // [Transaction L1] 이 블록이 관찰한 트랜잭션 투표 삭제
-                    // (참고: TX L2인 certificate_aggregator는 트랜잭션 확정 시점까지 유지해야 하므로 여기서 지우지 않음)
                     self.transaction_aggregator.remove(&bref);
                 }
-                // tracing::debug!("🧹 [GC] Pruned FPC state for round {}", r);
             }
         }
     }
 
     // ------------------------------------------------------------------------
-    // [Mode 1] 블록 단위 FPC
+    // [Mode 1] 블록 단위 FPC (최적화 적용)
     // ------------------------------------------------------------------------
 
     fn process_block_level(&mut self, block: &Data<StatementBlock>) {
-        // 🌟 [재귀 방지] 이미 프루닝된 오래된 블록은 처리하지 않음
         let prune_threshold = self.highest_known_round.saturating_sub(3);
         if block.round() < prune_threshold {
             return;
@@ -147,29 +129,45 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         }
         self.block_aggregator.insert(*block.reference(), HashMap::new());
 
-        // tracing::trace!("Processing block for FPC: {}", block.reference());
-
+        // 1. 부모 블록의 상태 전파 (Propagation)
         for parent_ref in block.includes() {
             if let Some(parent_block) = self.block_store.get_block(*parent_ref) {
                 self.process_block_level(&parent_block);
 
-                // [최적화 3] HashMap 전체 Clone 제거
-                let votes_to_cast: Vec<_> = self.block_aggregator
-                    .get(parent_ref)
-                    .unwrap()
-                    .iter()
-                    .flat_map(|(target_ref, agg)| {
-                        agg.voters().map(move |voter| (*target_ref, voter))
-                    })
-                    .collect();
+                // [최적화 1] Clone 제거 & 이미 Finalized된 타겟 제외
+                let votes_to_cast: Vec<_> = if let Some(parent_agg) = self.block_aggregator.get(parent_ref) {
+                    parent_agg.iter()
+                        .filter_map(|(target_ref, agg)| {
+                            // 이미 L2 Quorum(Finalized)에 도달했다면 전파 스킵
+                            if let Some(cert_agg) = self.block_certificate_aggregator.get(target_ref) {
+                                if cert_agg.is_quorum(&self.committee) {
+                                    return None;
+                                }
+                            }
+                            // 아직 Final 되지 않은 것만 전파
+                            Some(agg.voters().map(move |voter| (*target_ref, voter)))
+                        })
+                        .flatten()
+                        .collect()
+                } else {
+                    vec![]
+                };
 
+                // 수집된 유효 투표 일괄 적용
                 for (target_ref, voter) in votes_to_cast {
                     self.vote_block_level(block, target_ref, voter);
                 }
             }
         }
 
+        // 2. 부모 블록 자체에 대한 투표 (Direct Observation)
         for parent_ref in block.includes() {
+            // 부모 블록 자체가 이미 Finalized 되었다면 투표 생략 가능 (선택적 최적화)
+            if let Some(cert_agg) = self.block_certificate_aggregator.get(parent_ref) {
+                if cert_agg.is_quorum(&self.committee) {
+                    continue;
+                }
+            }
             self.vote_block_level(block, *parent_ref, block.author());
         }
     }
@@ -198,23 +196,27 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
             // Edge Trigger: 확정(Finalized) 순간 커밋 수행
             if !l2_already_finalized && l2_now_finalized {
                 if let Some(target_block) = self.block_store.get_block(target_block_ref) {
-                    // tracing::debug!("FPC-BLOCK: Finalized block {} (all txs)", target_block_ref);
                     for (locator, _tx) in target_block.shared_transactions() {
                         if !self.ledger_writer.is_vote_finalized(&locator) {
                             self.ledger_writer.write_finalized_vote(locator, self.block_store, true);
                         }
                     }
                 }
+
+                // [최적화 2] Finalized 즉시 현재 블록의 Aggregator에서 제거
+                // 이후 이 블록이 부모가 되어도 이 타겟은 전파되지 않음
+                if let Some(observer_aggs) = self.block_aggregator.get_mut(observer_block.reference()) {
+                    observer_aggs.remove(&target_block_ref);
+                }
             }
         }
     }
 
     // ------------------------------------------------------------------------
-    // [Mode 2] 트랜잭션 단위 FPC
+    // [Mode 2] 트랜잭션 단위 FPC (최적화 적용)
     // ------------------------------------------------------------------------
 
     fn process_transaction_level(&mut self, block: &Data<StatementBlock>) {
-        // 🌟 [재귀 방지]
         let prune_threshold = self.highest_known_round.saturating_sub(3);
         if block.round() < prune_threshold {
             return;
@@ -223,24 +225,38 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         if self.transaction_aggregator.contains_key(block.reference()) { return; }
         self.transaction_aggregator.insert(*block.reference(), Default::default());
 
+        // 1. 부모 블록의 상태 전파 (Propagation)
         for parent_ref in block.includes() {
             if let Some(parent_block) = self.block_store.get_block(*parent_ref) {
                 self.process_transaction_level(&parent_block);
 
-                // unwrap 안전 장치: GC로 인해 parent가 삭제되었을 수 있음
-                if let Some(parent_aggregator) = self.transaction_aggregator.get(parent_ref) {
-                    let parent_aggregator = parent_aggregator.clone();
+                // [최적화 1] Clone 제거 & 이미 Finalized된 Tx 제외
+                let votes_to_cast: Vec<_> = if let Some(parent_agg) = self.transaction_aggregator.get(parent_ref) {
+                    parent_agg.iter()
+                        .filter_map(|(locator, agg)| {
+                            // 이미 L2 Quorum에 도달했다면(Finalized) 전파 스킵
+                            if let Some(cert_agg) = self.certificate_aggregator.get(locator) {
+                                if cert_agg.is_quorum(&self.committee) {
+                                    return None;
+                                }
+                            }
+                            // 아직 Final 되지 않은 것만 전파
+                            Some(agg.voters().map(move |voter| (*locator, voter)))
+                        })
+                        .flatten()
+                        .collect()
+                } else {
+                    vec![]
+                };
 
-                    // 부모 상태 병합
-                    for (locator, agg) in parent_aggregator {
-                        for voter in agg.voters() {
-                            self.vote_transaction_level(block, &locator, voter);
-                        }
-                    }
+                // 수집된 유효 투표 일괄 적용
+                for (locator, voter) in votes_to_cast {
+                    self.vote_transaction_level(block, &locator, voter);
                 }
             }
         }
 
+        // 2. 현재 블록의 투표 (Direct Vote)
         for (offset, statement) in block.statements().iter().enumerate() {
             match statement {
                 BaseStatement::Vote(locator, vote) => {
@@ -267,6 +283,7 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         transaction: &TransactionLocator,
         tx_voter: AuthorityIndex,
     ) {
+        // 이미 Ledger에 써졌다면 중복 처리 방지 (가장 빠른 체크)
         if self.ledger_writer.is_vote_finalized(transaction) {
             return;
         }
@@ -284,14 +301,20 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
             return;
         }
 
+        // [L2] Certificate Aggregation
         let cert_aggregator = self.certificate_aggregator.entry(*transaction).or_default();
         let l2_was_quorum = cert_aggregator.is_quorum(&self.committee);
         cert_aggregator.add(block.author(), &self.committee);
         let l2_is_quorum = cert_aggregator.is_quorum(&self.committee);
 
         if !l2_was_quorum && l2_is_quorum {
-            // tracing::debug!("FPC-TX: Finalized transaction {}", transaction);
             self.ledger_writer.write_finalized_vote(*transaction, self.block_store, true);
+
+            // [최적화 2] Finalized 즉시 현재 블록의 Aggregator에서 제거
+            // 이렇게 하면 이 블록의 자식들은 이 Tx에 대한 투표를 더 이상 상속받지 않음
+            if let Some(block_aggs) = self.transaction_aggregator.get_mut(block.reference()) {
+                block_aggs.remove(transaction);
+            }
         }
     }
 }
