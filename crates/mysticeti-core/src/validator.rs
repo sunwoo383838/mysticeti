@@ -185,19 +185,19 @@ impl Validator {
                 .unwrap();
         });
 
-        // --- (7) (신규) DKG 프로토콜 실행 ---
-        tracing::info!("[Validator {authority}] 노드 시작. DKG를 위해 모든 피어 연결 대기 중...");
-        // 🔽 (신규) 모든 피어(n-1)가 연결될 때까지 대기
-        network_synchronizer.wait_for_all_peers(committee.len()).await;
-        tracing::info!("[Validator {authority}] 모든 피어 연결 완료. DKG 프로토콜 시작...");
-        // 🔽 DKG 매니저에게 DKG 시작 명령 (1단계: 커밋 브로드캐스트 시작)
-        dkg_manager.lock().await.start_dkg().await;
-        // 🔽 DKG 매니저가 완료 신호를 줄 때까지 대기
-        dkg_complete_notify.notified().await;
-        // 🔽 DKG 결과(키)를 로컬에 저장
-        let (_, sk) = dkg_manager.lock().await.get_keys().expect("DKG failed or keys not set");
-        *my_secret_share.lock().await = Some(sk);
-        tracing::info!("[Validator {authority}] DKG 완료. 마스터 공개키 저장됨.");
+        // // --- (7) (신규) DKG 프로토콜 실행 ---
+        // tracing::info!("[Validator {authority}] 노드 시작. DKG를 위해 모든 피어 연결 대기 중...");
+        // // 🔽 (신규) 모든 피어(n-1)가 연결될 때까지 대기
+        // network_synchronizer.wait_for_all_peers(committee.len()).await;
+        // tracing::info!("[Validator {authority}] 모든 피어 연결 완료. DKG 프로토콜 시작...");
+        // // 🔽 DKG 매니저에게 DKG 시작 명령 (1단계: 커밋 브로드캐스트 시작)
+        // dkg_manager.lock().await.start_dkg().await;
+        // // 🔽 DKG 매니저가 완료 신호를 줄 때까지 대기
+        // dkg_complete_notify.notified().await;
+        // // 🔽 DKG 결과(키)를 로컬에 저장
+        // let (_, sk) = dkg_manager.lock().await.get_keys().expect("DKG failed or keys not set");
+        // *my_secret_share.lock().await = Some(sk);
+        // tracing::info!("[Validator {authority}] DKG 완료. 마스터 공개키 저장됨.");
 
         tracing::info!("[Validator {authority}] Starting Transaction Generator...");
         let tx_gen_ready = TransactionGenerator::start(
