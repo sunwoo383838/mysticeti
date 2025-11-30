@@ -38,17 +38,26 @@ impl NullifierDB {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_bloom_filter(10.0, false);
-        opts.set_block_based_table_factory(&block_opts);
+        // 🌟 [튜닝] 고성능 쓰기 최적화 옵션
+        opts.increase_parallelism(num_cpus::get().max(4) as i32); // 병렬 스레드 증가
+        opts.set_max_background_jobs(6); // 백그라운드 작업(플러시/컴팩션) 수 증가
+        opts.set_write_buffer_size(256 * 1024 * 1024); // MemTable 크기 256MB (기존 64MB)
+        opts.set_max_write_buffer_number(6); // MemTable 개수 증가 (Write Stall 방지)
+        opts.set_target_file_size_base(128 * 1024 * 1024); // SST 파일 크기 증가
 
-        opts.increase_parallelism(num_cpus::get().max(2) as i32);
-        opts.optimize_level_style_compaction(512 * 1024 * 1024);
-        opts.set_write_buffer_size(256 * 1024 * 1024);
-        opts.set_max_background_jobs(8);
-
+        // Write Stall(쓰기 멈춤) 트리거 완화
+        opts.set_level_zero_file_num_compaction_trigger(8);
         opts.set_level_zero_slowdown_writes_trigger(20);
         opts.set_level_zero_stop_writes_trigger(40);
+
+        // 압축 (LZ4 권장, CPU 여유 있으면 사용)
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_bloom_filter(10.0, false);
+        // 블록 캐시 증가 (읽기 성능용이지만 메타데이터 관리에 도움됨)
+        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(512 * 1024 * 1024));
+        opts.set_block_based_table_factory(&block_opts);
 
         let txn_db_opts = TransactionDBOptions::default();
         let db = TransactionDB::open_cf(

@@ -10,7 +10,7 @@ use std::{
 };
 use ark_bls12_381::Fr;
 use minibytes::Bytes;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rand::seq::index::sample;
 use rayon::prelude::*;
 use tokio::sync::mpsc;
@@ -55,7 +55,6 @@ pub trait BlockHandler: Send + Sync {
 
     fn cleanup(&self) {}
 
-    fn transaction_time(&self) -> Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>;
 }
 
 const REAL_BLOCK_HANDLER_TXN_SIZE: usize = 512;
@@ -71,7 +70,7 @@ const fn assert_constants() {
 
 pub struct RealBlockHandler {
     transaction_votes: TransactionAggregator<QuorumThreshold, TransactionLog>,
-    pub transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
+    pub transaction_time: Arc<RwLock<HashMap<TransactionLocator, TimeInstant>>>,
     committee: Arc<Committee>,
     authority: AuthorityIndex,
     block_store: BlockStore,
@@ -234,7 +233,7 @@ impl BlockHandler for RealBlockHandler {
             }
         }
 
-        let transaction_time = self.transaction_time.lock();
+        let transaction_time = self.transaction_time.read();
 
         for (block, check_individual) in blocks {
             if !self.consensus_only {
@@ -345,7 +344,7 @@ impl BlockHandler for RealBlockHandler {
 
     fn handle_proposal(&mut self, block: &Data<StatementBlock>) {
         self.pending_transactions -= block.shared_transactions().count();
-        let mut transaction_time = self.transaction_time.lock();
+        let mut transaction_time = self.transaction_time.write();
 
         let block_time = runtime::timestamp_utc();
 
@@ -372,9 +371,6 @@ impl BlockHandler for RealBlockHandler {
         }
     }
 
-    fn transaction_time(&self) -> Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>> {
-        self.transaction_time.clone()
-    }
 
     fn state(&self) -> Bytes {
         self.transaction_votes.state()
@@ -387,7 +383,7 @@ impl BlockHandler for RealBlockHandler {
     fn cleanup(&self) {
         let _timer = self.metrics.block_handler_cleanup_util.utilization_timer();
         // todo - all of this should go away and we should measure tx latency differently
-        let mut l = self.transaction_time.lock();
+        let mut l = self.transaction_time.write();
         l.retain(|_k, v| v.elapsed() < Duration::from_secs(10));
     }
 }
@@ -396,7 +392,7 @@ impl BlockHandler for RealBlockHandler {
 pub struct TestBlockHandler {
     last_transaction: u64,
     transaction_votes: TransactionAggregator<QuorumThreshold>,
-    pub transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
+    pub transaction_time: Arc<RwLock<HashMap<TransactionLocator, TimeInstant>>>,
     committee: Arc<Committee>,
     authority: AuthorityIndex,
     pub proposed: Vec<TransactionLocator>,
@@ -456,7 +452,7 @@ impl BlockHandler for TestBlockHandler {
             let next_transaction = Self::make_transaction(self.last_transaction);
             response.push(BaseStatement::Share(next_transaction));
         }
-        let transaction_time = self.transaction_time.lock();
+        let transaction_time = self.transaction_time.read();
         for (block, _) in blocks {
             tracing::debug!("Processing {block:?}");
             let response_option: Option<&mut Vec<BaseStatement>> = if require_response {
@@ -479,7 +475,7 @@ impl BlockHandler for TestBlockHandler {
     }
 
     fn handle_proposal(&mut self, block: &Data<StatementBlock>) {
-        let mut transaction_time = self.transaction_time.lock();
+        let mut transaction_time = self.transaction_time.write();
         for (locator, _) in block.shared_transactions() {
             transaction_time.insert(locator, TimeInstant::now());
             self.proposed.push(locator);
@@ -495,10 +491,6 @@ impl BlockHandler for TestBlockHandler {
         let bytes =
             bincode::serialize(&state).expect("Failed to serialize transaction aggregator state");
         bytes.into()
-    }
-
-    fn transaction_time(&self) -> Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>> {
-        self.transaction_time.clone()
     }
 
     fn recover_state(&mut self, state: &Bytes) {
@@ -518,7 +510,7 @@ pub struct ExecutionRequest {
 pub struct ExecutionService {
     nullifier_db: Arc<NullifierDB>,
     metrics: Arc<Metrics>,
-    transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
+    transaction_time: Arc<RwLock<HashMap<TransactionLocator, TimeInstant>>>,
     finalized_cache: HashSet<TransactionLocator>,
 }
 
@@ -526,7 +518,7 @@ impl ExecutionService {
     pub fn spawn_parallel(
         nullifier_db: Arc<NullifierDB>,
         metrics: Arc<Metrics>,
-        transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
+        transaction_time: Arc<RwLock<HashMap<TransactionLocator, TimeInstant>>>,
     ) -> (mpsc::Sender<ExecutionRequest>, JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel(300_000);
 
@@ -612,7 +604,7 @@ impl ExecutionService {
                 // 워커 스레드가 수행하므로 Dispatcher의 부하를 줄여줌
                 let current_timestamp = runtime::timestamp_utc();
                 {
-                    let transaction_time_lock = tx_time.lock();
+                    let transaction_time_lock = tx_time.read();
                     for req in &current_request_batch {
                         Self::update_metrics(
                             &metrics,
