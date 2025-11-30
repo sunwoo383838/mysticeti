@@ -528,7 +528,7 @@ impl ExecutionService {
         metrics: Arc<Metrics>,
         transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>,
     ) -> (mpsc::Sender<ExecutionRequest>, JoinHandle<()>) {
-        let (sender, receiver) = mpsc::channel(100_000);
+        let (sender, receiver) = mpsc::channel(300_000);
 
         let service = Self {
             nullifier_db,
@@ -547,9 +547,9 @@ impl ExecutionService {
     async fn run(mut self, mut receiver: mpsc::Receiver<ExecutionRequest>) {
         tracing::info!("🚀 [ExecutionService] Batch Writer Started (RocksDB Log).");
 
-        let mut request_batch = Vec::with_capacity(1000);
-        let mut nullifier_batch = Vec::with_capacity(1000);
-        let mut locator_batch = Vec::with_capacity(1000); // 🌟 추가
+        let mut request_batch = Vec::with_capacity(2000);
+        let mut nullifier_batch = Vec::with_capacity(2000);
+        let mut locator_batch = Vec::with_capacity(2000); // 🌟 추가
 
         while let Some(req) = receiver.recv().await {
             // 1. 중복 체크
@@ -561,7 +561,7 @@ impl ExecutionService {
             request_batch.push(req);
 
             // 2. 배치 수집
-            while request_batch.len() < 1000 {
+            while request_batch.len() < 2000 {
                 match receiver.try_recv() {
                     Ok(r) => {
                         if !self.finalized_cache.contains(&r.locator) {
@@ -584,32 +584,48 @@ impl ExecutionService {
                 }
             }
 
-            // 4. 병렬/블로킹 실행
+
+            // 4. 병렬 실행을 위한 데이터 복제 (Arc 사용)
             let db = self.nullifier_db.clone();
+            let metrics = self.metrics.clone();
+            let tx_time = self.transaction_time.clone();
+
+            // 배치를 통째로 이동(Move)시켜야 하므로 clone()
             let nullifiers = nullifier_batch.clone();
             let locators = locator_batch.clone();
 
+            // 메트릭 업데이트에 필요한 데이터도 복제해서 넘김
+            // (Dispatcher가 기다리지 않으므로, 메트릭 업데이트도 워커가 해야 함)
+            let current_request_batch = request_batch.clone();
+
+
             tokio::task::spawn_blocking(move || {
+                // [Worker Thread]
+
+                // 1. DB 쓰기 (Blocking I/O)
                 if let Err(e) = db.commit_execution_batch(nullifiers, locators) {
                     tracing::error!("💥 DB Execution Batch Failed: {:?}", e);
+                    return; // 실패 시 메트릭 업데이트 건너뜀
                 }
-            }).await.expect("DB Task Panicked");
+
+                // 2. 메트릭 업데이트 (메모리 연산)
+                // 워커 스레드가 수행하므로 Dispatcher의 부하를 줄여줌
+                let current_timestamp = runtime::timestamp_utc();
+                {
+                    let transaction_time_lock = tx_time.lock();
+                    for req in &current_request_batch {
+                        Self::update_metrics(
+                            &metrics,
+                            transaction_time_lock.get(&req.locator),
+                            current_timestamp,
+                            &req.transaction,
+                            req.is_fpc
+                        );
+                    }
+                }
+            });
 
             // 5. 메트릭 업데이트 (로그 파일 쓰기 제거됨)
-            let current_timestamp = runtime::timestamp_utc();
-            {
-                let transaction_time_lock = self.transaction_time.lock();
-                for req in &request_batch {
-
-                    Self::update_metrics(
-                        &self.metrics,
-                        transaction_time_lock.get(&req.locator),
-                        current_timestamp,
-                        &req.transaction,
-                        req.is_fpc
-                    );
-                }
-            }
 
             request_batch.clear();
         }

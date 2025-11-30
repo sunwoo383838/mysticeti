@@ -44,6 +44,11 @@ impl NullifierDB {
 
         opts.increase_parallelism(num_cpus::get().max(2) as i32);
         opts.optimize_level_style_compaction(512 * 1024 * 1024);
+        opts.set_write_buffer_size(256 * 1024 * 1024);
+        opts.set_max_background_jobs(8);
+
+        opts.set_level_zero_slowdown_writes_trigger(20);
+        opts.set_level_zero_stop_writes_trigger(40);
 
         let txn_db_opts = TransactionDBOptions::default();
         let db = TransactionDB::open_cf(
