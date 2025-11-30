@@ -518,7 +518,7 @@ impl ExecutionService {
     pub fn spawn_parallel(
         nullifier_db: Arc<NullifierDB>,
         metrics: Arc<Metrics>,
-        transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>, // RwLock에서 Mutex로 롤백 (또는 RwLock 유지 가능)
+        transaction_time: Arc<RwLock<HashMap<TransactionLocator, TimeInstant>>>, // RwLock에서 Mutex로 롤백 (또는 RwLock 유지 가능)
     ) -> (async_channel::Sender<ExecutionRequest>, Vec<JoinHandle<()>>) {
         // 🌟 1. MPMC 채널 사용 (async_channel)
         // 여러 워커가 동시에 recv()를 호출할 수 있습니다.
@@ -555,7 +555,7 @@ impl ExecutionService {
         receiver: async_channel::Receiver<ExecutionRequest>,
         db: Arc<NullifierDB>,
         metrics: Arc<Metrics>,
-        transaction_time: Arc<Mutex<HashMap<TransactionLocator, TimeInstant>>>, // 또는 RwLock
+        transaction_time: Arc<RwLock<HashMap<TransactionLocator, TimeInstant>>>, // 또는 RwLock
         cache: Arc<Mutex<HashSet<TransactionLocator>>>,
     ) {
         tracing::info!("🚀 [ExecutionService] Worker {} Started.", id);
@@ -627,7 +627,7 @@ impl ExecutionService {
             // 5. 메트릭 업데이트
             let current_timestamp = crate::runtime::timestamp_utc();
             {
-                let transaction_time_lock = transaction_time.lock(); // Mutex 사용 가정
+                let transaction_time_lock = transaction_time.read(); // Mutex 사용 가정
                 for req in &request_batch {
                     Self::update_metrics(
                         &metrics,
@@ -680,7 +680,7 @@ pub struct CommitHandler {
     committee: Arc<Committee>,
     committed_leaders: Vec<BlockReference>,
 
-    execution_sender: mpsc::Sender<ExecutionRequest>,
+    execution_sender: async_channel::Sender<ExecutionRequest>,
     metrics: Arc<Metrics>,
 
     finalized_cache_shim: HashSet<TransactionLocator>,
@@ -690,7 +690,7 @@ pub struct CommitHandler {
 impl CommitHandler {
     pub fn new(
         committee: Arc<Committee>,
-        execution_sender: mpsc::Sender<ExecutionRequest>, // Sender 주입
+        execution_sender: async_channel::Sender<ExecutionRequest>, // Sender 주입
         node_public_config: &NodePublicConfig,
         metrics: Arc<Metrics>
     ) -> Self {
