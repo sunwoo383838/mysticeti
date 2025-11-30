@@ -1,3 +1,4 @@
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use ark_bls12_381::Fr;
@@ -83,7 +84,23 @@ impl DkgManager {
 
     pub fn register_peer(&mut self, peer_id: AuthorityIndex, sender: mpsc::Sender<NetworkMessage>) {
         if peer_id != self.my_index {
-            self.network_senders.insert(peer_id, sender);
+            self.network_senders.insert(peer_id, sender.clone());
+
+            // 🌟 [수정] 이미 DKG가 시작되어 커밋을 생성한 상태라면(my_commits가 존재),
+            // 뒤늦게 연결(또는 재연결)된 피어에게 내 커밋을 다시 전송해줍니다.
+            if !self.my_commits.is_empty() {
+                let msg = NetworkMessage::DkgCommitment(self.my_commits.clone());
+                let peer_id_clone = peer_id;
+
+                // 비동기 전송을 위해 토키오 태스크 스폰 (블로킹 방지)
+                tokio::spawn(async move {
+                    if let Err(e) = sender.send(msg).await {
+                        tracing::warn!("[DKG] 재연결된 {peer_id_clone}번 피어에게 커밋 재전송 실패: {e}");
+                    } else {
+                        tracing::info!("[DKG] 재연결된 {peer_id_clone}번 피어에게 커밋 재전송 완료");
+                    }
+                });
+            }
         }
     }
 
@@ -94,6 +111,12 @@ impl DkgManager {
     pub async fn start_dkg(&mut self) {
         match self.state {
             DkgState::Idle | DkgState::AwaitingCommitments(_) => {
+                // 이미 시작했는지 확인 (my_commits가 비어있지 않으면 이미 시작한 것임)
+                if !self.my_commits.is_empty() {
+                    tracing::warn!("DKG start called but already generated commits. Skipping generation.");
+                    return;
+                }
+
                 let global_seed = self.global_seed;
                 let mut rng = get_dkg_rng_for_participant(global_seed, self.my_index);
 
