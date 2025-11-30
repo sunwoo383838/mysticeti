@@ -219,6 +219,7 @@ fn verify(
     merkle_root: Arc<Fr>,
     metrics: Arc<Metrics>,
 ) -> Result<(), &'static str> {
+
     let vote_tx: VoteTransaction = match tx.get_vote() {
         Ok(tx) => tx,
         Err(e) => {

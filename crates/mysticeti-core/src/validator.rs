@@ -128,13 +128,6 @@ impl Validator {
             &crypto_config,
         )));
 
-        TransactionGenerator::start(
-            tx_sender_for_generator,
-            authority,
-            client_parameters,
-            metrics.clone(),
-        );
-
         let core = Core::open(
             block_handler,
             authority,
@@ -205,6 +198,22 @@ impl Validator {
         let (_, sk) = dkg_manager.lock().await.get_keys().expect("DKG failed or keys not set");
         *my_secret_share.lock().await = Some(sk);
         tracing::info!("[Validator {authority}] DKG 완료. 마스터 공개키 저장됨.");
+
+        tracing::info!("[Validator {authority}] Starting Transaction Generator...");
+        let tx_gen_ready = TransactionGenerator::start(
+            tx_sender_for_generator,
+            authority,
+            client_parameters,
+            metrics.clone(),
+        );
+
+        tracing::info!("[Validator {authority}] Waiting for transactions to be loaded/serialized...");
+        // oneshot 채널을 기다림
+        tx_gen_ready.await.expect("Transaction Generator crashed during startup");
+
+        // 🌟 4. [신규] 모든 준비 완료 후 합의(블록 생성) 시작
+        tracing::info!("[Validator {authority}] Transactions ready. Starting Consensus (Block Production)...");
+        network_synchronizer.start_consensus().await;
 
         if let Some(fault_config) = &fault_config {
             match fault_config {

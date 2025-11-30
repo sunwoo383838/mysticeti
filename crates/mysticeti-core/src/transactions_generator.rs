@@ -1,6 +1,3 @@
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
 use std::{cmp::min, sync::Arc, time::Duration};
 use std::collections::VecDeque;
 use std::fs::File;
@@ -9,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use eyre::Context;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot}; // oneshot 추가
 use crypto::types::VoteTransaction;
 use crate::{
     config::{ClientParameters, NodePublicConfig},
@@ -29,79 +26,85 @@ pub struct TransactionGenerator {
 impl TransactionGenerator {
     const TARGET_BLOCK_INTERVAL: Duration = Duration::from_millis(100);
 
+    // 반환 타입 변경: void -> oneshot::Receiver<()>
     pub fn start(
         sender: mpsc::Sender<Vec<Transaction>>,
         seed: AuthorityIndex,
         client_parameters: ClientParameters,
         metrics: Arc<Metrics>,
-    ) {
-        let home = dirs_next::home_dir().expect("Failed to get home directory");
-        let file_path = home.join("working_dir").join(format!("validator_{}_txs.bin", seed));
-        let file_path_str = file_path.display().to_string();
+    ) -> oneshot::Receiver<()> {
+        let (notify_sender, notify_receiver) = oneshot::channel();
 
-        let transactions = match File::open(&file_path) {
-            Ok(file) => {
-                tracing::info!("Loooooading transactions from file: {}", file_path_str);
+        // 1. 무거운 파일 로딩 및 역직렬화 작업을 Blocking Thread에서 실행
+        runtime::Handle::current().spawn_blocking(move || {
+            let home = dirs_next::home_dir().expect("Failed to get home directory");
+            let file_path = home.join("working_dir").join(format!("validator_{}_txs.bin", seed));
+            let file_path_str = file_path.display().to_string();
 
-                let reader = BufReader::new(file);
+            let transactions = match File::open(&file_path) {
+                Ok(file) => {
+                    tracing::info!("Loooooading transactions from file: {}", file_path_str);
+                    let reader = BufReader::new(file);
 
-                // 1. Deserialize (이 부분은 직렬 처리라 시간 좀 걸림)
-                let vote_txs: Vec<VoteTransaction> = bincode::deserialize_from(reader)
-                    .context(format!("Failed to deserialize transactions from '{}'.", file_path_str))
-                    .expect("Cannot deserialize transaction file. Exiting.");
+                    // Deserialize
+                    let vote_txs: Vec<VoteTransaction> = bincode::deserialize_from(reader)
+                        .context(format!("Failed to deserialize transactions from '{}'.", file_path_str))
+                        .expect("Cannot deserialize transaction file. Exiting.");
 
-                tracing::info!(
-                    "Deserialized {} vote transactions. Converting to Transactions in parallel...",
-                    vote_txs.len()
-                );
+                    tracing::info!(
+                        "Deserialized {} vote transactions. Converting to Transactions in parallel...",
+                        vote_txs.len()
+                    );
 
-                // 2. [수정] 진행 상황 확인용 Atomic Counter 생성
-                let progress_counter = AtomicUsize::new(0);
+                    let progress_counter = AtomicUsize::new(0);
 
-                // 3. Parallel Convert
-                let txs: Vec<Transaction> = vote_txs
-                    .into_par_iter()
-                    .map(|vt| {
-                        let tx = Transaction::new_vote(&vt)
-                            .expect("Failed to create Transaction from VoteTransaction");
+                    // Parallel Convert
+                    let txs: Vec<Transaction> = vote_txs
+                        .into_par_iter()
+                        .map(|vt| {
+                            let tx = Transaction::new_vote(&vt)
+                                .expect("Failed to create Transaction from VoteTransaction");
+                            let count = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            if count % 100_000 == 0 {
+                                tracing::info!("Converted {} transactions...", count);
+                            }
+                            tx
+                        })
+                        .collect();
 
-                        // [수정] 카운터 증가 및 로그 출력
-                        // fetch_add는 이전 값을 반환하므로 1을 더해 현재 값으로 만듦
-                        let count = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::info!("Conversion complete. Loaded {} transactions.", txs.len());
+                    txs.into()
+                }
+                Err(e) => {
+                    panic!(
+                        "Failed to open transaction file '{}': {}. Cannot continue.",
+                        file_path_str, e
+                    )
+                }
+            };
 
-                        if count % 100_000 == 0 {
-                            tracing::info!("Converted {} transactions...", count);
-                        }
+            tracing::info!("트랜잭션 준비 완료, 제너레이터 대기 상태 진입");
 
-                        tx
-                    })
-                    .collect();
+            // 2. 준비 완료 신호 전송
+            let _ = notify_sender.send(());
 
-                tracing::info!("Conversion complete. Loaded {} transactions.", txs.len());
-                txs.into()
-            }
-            Err(e) => {
-                panic!(
-                    "Failed to open transaction file '{}': {}. Cannot continue.",
-                    file_path_str, e
-                )
-            }
-        };
+            // 3. 실제 전송 루프는 Async Task로 스폰
+            runtime::Handle::current().spawn(
+                Self {
+                    sender,
+                    transactions,
+                    client_parameters,
+                    metrics,
+                }
+                    .run(),
+            );
+        });
 
-        tracing::info!("트랜잭션 준비 완료, 제너레이터 시작");
-        runtime::Handle::current().spawn(
-            Self {
-                sender,
-                transactions,
-                client_parameters,
-                metrics,
-            }
-                .run(),
-        );
+        notify_receiver
     }
 
     pub async fn run(mut self) {
-
+        // (기존 run 로직과 동일)
         let load = self.client_parameters.load;
         let transactions_per_block_interval = (load + 9) / 10;
 
@@ -120,7 +123,7 @@ impl TransactionGenerator {
                 continue;
             }
 
-            let mut block= Vec::with_capacity(transactions_per_block_interval);
+            let mut block = Vec::with_capacity(transactions_per_block_interval);
 
             for _ in 0..transactions_per_block_interval {
                 if let Some(mut tx) = self.transactions.pop_front() {

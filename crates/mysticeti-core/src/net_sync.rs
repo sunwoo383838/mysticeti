@@ -103,7 +103,6 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
             notify.clone(),
             metrics.clone(),
         );
-        syncer.force_new_block(0);
         let syncer = Arc::new(CoreThreadDispatcher::start(syncer));
         let (stop_sender, stop_receiver) = mpsc::channel(1);
         stop_sender.try_send(()).unwrap(); // occupy the only available permit, so that all other calls to send() will block
@@ -147,6 +146,9 @@ impl<H: BlockHandler + 'static> NetworkSyncer<H> {
         }
     }
 
+    pub async fn start_consensus(&self) {
+        self.inner.syncer.force_new_block(0).await;
+    }
     pub fn core_syncer_handle(&self) -> Arc<CoreThreadDispatcher<H, Arc<Notify>>> {
         self.inner.syncer.clone()
     }
