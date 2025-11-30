@@ -171,6 +171,7 @@ impl FpcService {
     }
 
     fn process_block_internal(&self, block: Data<StatementBlock>) {
+        tracing::info!("process block internal");
         // 🔒 Mutex 획득
         let mut guard = self.state.lock();
 

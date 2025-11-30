@@ -227,6 +227,8 @@ impl<H: BlockHandler> Core<H> {
         &mut self,
         blocks: Vec<(Data<StatementBlock>, bool)>
     ) -> Vec<Data<StatementBlock>> {
+        tracing::info!("add blocks");
+
         let _timer = self
             .metrics
             .utilization_timer
