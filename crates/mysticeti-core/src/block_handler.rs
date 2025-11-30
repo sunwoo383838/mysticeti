@@ -539,11 +539,13 @@ impl ExecutionService {
     async fn run(mut self, mut receiver: mpsc::Receiver<ExecutionRequest>) {
         tracing::info!("🚀 [ExecutionService] Batch Writer Started (RocksDB Log).");
 
-        let mut request_batch = Vec::with_capacity(2000);
-        let mut nullifier_batch = Vec::with_capacity(2000);
-        let mut locator_batch = Vec::with_capacity(2000); // 🌟 추가
+        let mut request_batch = Vec::with_capacity(3000);
+        let mut nullifier_batch = Vec::with_capacity(3000);
+        let mut locator_batch = Vec::with_capacity(3000); // 🌟 추가
 
         while let Some(req) = receiver.recv().await {
+            let _timer = self.metrics.execution_util.utilization_timer();
+
             // 1. 중복 체크
             if self.finalized_cache.contains(&req.locator) {
                 continue;
@@ -553,7 +555,7 @@ impl ExecutionService {
             request_batch.push(req);
 
             // 2. 배치 수집
-            while request_batch.len() < 2000 {
+            while request_batch.len() < 3000 {
                 match receiver.try_recv() {
                     Ok(r) => {
                         if !self.finalized_cache.contains(&r.locator) {
@@ -564,6 +566,9 @@ impl ExecutionService {
                     Err(_) => break,
                 }
             }
+
+            self.metrics.execution_dequeued.inc_by(request_batch.len() as u64);
+
 
             // 3. 데이터 추출
             nullifier_batch.clear();
@@ -662,6 +667,7 @@ pub struct CommitHandler {
     committed_leaders: Vec<BlockReference>,
 
     execution_sender: mpsc::Sender<ExecutionRequest>,
+    metrics: Arc<Metrics>,
 
     finalized_cache_shim: HashSet<TransactionLocator>,
     enable_block_fpc: bool,
@@ -672,6 +678,7 @@ impl CommitHandler {
         committee: Arc<Committee>,
         execution_sender: mpsc::Sender<ExecutionRequest>, // Sender 주입
         node_public_config: &NodePublicConfig,
+        metrics: Arc<Metrics>
     ) -> Self {
         Self {
             commit_interpreter: Linearizer::new(),
@@ -680,6 +687,7 @@ impl CommitHandler {
             execution_sender,
             finalized_cache_shim: HashSet::new(),
             enable_block_fpc: node_public_config.parameters.enable_block_fpc,
+            metrics
         }
     }
 
@@ -695,46 +703,39 @@ impl CommitHandler {
 
 impl LedgerWriter for CommitHandler {
     fn write_finalized_vote(&mut self, vote: TransactionLocator, block_store: &BlockStore, is_fpc: bool) {
-        // 1. 1차 중복 방지 (C-Path 로직 내 중복 호출 방지용, 가벼움)
-        if !self.finalized_cache_shim.insert(vote) {
-            return;
-        }
-
-        // 2. 트랜잭션 조회 (메모리)
+        if !self.finalized_cache_shim.insert(vote) { return; }
         if let Some(transaction) = block_store.get_transaction(&vote) {
-            let req = ExecutionRequest {
-                locator: vote,
-                transaction,
-                is_fpc,
-            };
+            let req = ExecutionRequest { locator: vote, transaction, is_fpc };
 
-            // 3. 실행 서비스로 전송 (Non-blocking, 즉시 리턴)
-            if let Err(e) = self.execution_sender.try_send(req) {
-                // 큐가 가득 찬 경우 (Backpressure)
-                tracing::warn!("Execution queue full! Dropping vote execution: {:?}", e);
+            match self.execution_sender.try_send(req) {
+                Ok(_) => {
+                    // 🌟 [추가] Enqueue 메트릭 증가
+                    self.metrics.execution_enqueued.inc();
+                }
+                Err(e) => {
+                    tracing::warn!("Execution queue full! {:?}", e);
+                }
             }
         }
     }
 
     fn write_finalized_block(&mut self, block: &Data<StatementBlock>, is_fpc: bool) {
-        // 블록 내의 모든 공유 트랜잭션을 순회
         for (locator, transaction) in block.shared_transactions() {
-            // 1. 중복 체크 (메모리)
-            if !self.finalized_cache_shim.insert(locator) {
-                continue;
-            }
-
-            // 2. 트랜잭션 데이터는 이미 block 안에 있으므로 DB 조회 불필요!
-            //    즉시 복제하여 전송
+            if !self.finalized_cache_shim.insert(locator) { continue; }
             let req = ExecutionRequest {
                 locator,
-                transaction: transaction.clone(), // 데이터 복사 (불가피하지만 I/O보다 훨씬 빠름)
+                transaction: transaction.clone(),
                 is_fpc,
             };
 
-            // 3. 큐 전송
-            if let Err(e) = self.execution_sender.try_send(req) {
-                tracing::warn!("Execution queue full! {:?}", e);
+            match self.execution_sender.try_send(req) {
+                Ok(_) => {
+                    // 🌟 [추가] Enqueue 메트릭 증가
+                    self.metrics.execution_enqueued.inc();
+                }
+                Err(e) => {
+                    tracing::warn!("Execution queue full! {:?}", e);
+                }
             }
         }
     }

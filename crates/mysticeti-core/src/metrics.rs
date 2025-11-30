@@ -99,6 +99,10 @@ pub struct Metrics {
     pub transaction_committed_latency: HistogramSender<Duration>,
     pub transaction_verified_latency: HistogramSender<Duration>,
 
+    pub execution_enqueued: IntCounter, // 이미 제안했었으나 명시적으로 추가
+    pub execution_dequeued: IntCounter,
+    pub execution_util: IntCounter,
+
     pub proposed_block_size_bytes: HistogramSender<usize>,
     pub proposed_block_transaction_count: HistogramSender<usize>,
     pub proposed_block_vote_count: HistogramSender<usize>,
@@ -193,6 +197,7 @@ impl Metrics {
                 registry,
                 "proposed_block_size_bytes",
             ),
+
             proposed_block_transaction_count: HistogramReporter::new_in_registry(
                 proposed_block_transaction_count_hist,
                 registry,
@@ -224,6 +229,22 @@ impl Metrics {
         };
 
         let metrics = Self {
+            execution_enqueued: register_int_counter_with_registry!(
+                "execution_enqueued",
+                "Number of transactions enqueued for execution",
+                registry,
+            ).unwrap(),
+            execution_dequeued: register_int_counter_with_registry!(
+                "execution_dequeued",
+                "Number of transactions dequeued and processed by execution service",
+                registry,
+            ).unwrap(),
+            execution_util: register_int_counter_with_registry!(
+                "execution_util",
+                "Utilization of execution service worker",
+                registry,
+            ).unwrap(),
+
             fpc_block_util: register_int_counter_with_registry!(
                 "fpc_block_util",
                 "Utilization of FPC block processor",

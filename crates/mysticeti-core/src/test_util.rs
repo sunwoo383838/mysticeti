@@ -138,6 +138,7 @@ pub fn committee_and_cores_persisted_epoch_duration(
                 committee.clone(),
                 execution_sender, // 🚀 병렬 실행 서비스로 연결되는 채널
                 &public_config,
+                metrics.clone()
             );
 
             let block_store_for_fpc = recovered.block_store.clone();
