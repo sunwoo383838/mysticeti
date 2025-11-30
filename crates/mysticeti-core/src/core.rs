@@ -44,7 +44,7 @@ use crate::committee::{QuorumThreshold, StakeAggregator};
 use crate::consensus::linearizer::Linearizer;
 use crate::dkg_manager::DkgManager;
 use crate::finalization_interpreter::FinalizationInterpreter;
-use crate::fpc_service::FpcMessage;
+use crate::fpc_service::{FpcClient};
 use crate::syncer::CommitObserver;
 use crate::types::TransactionLocator;
 
@@ -66,7 +66,7 @@ pub struct Core<H: BlockHandler> {
     epoch_manager: EpochManager,
     rounds_in_epoch: RoundNumber,
     committer: UniversalCommitter,
-    fpc_sender: mpsc::Sender<FpcMessage>,
+    fpc_client: FpcClient,
     linearizer: Linearizer,
     enable_block_fpc: bool,
     dkg_manager: Arc<Mutex<DkgManager>>,
@@ -97,7 +97,7 @@ impl<H: BlockHandler> Core<H> {
         recovered: RecoveredState,
         mut wal_writer: WalWriter,
         options: CoreOptions,
-        fpc_sender: mpsc::Sender<FpcMessage>,
+        fpc_client: FpcClient,
         dkg_manager: Arc<Mutex<DkgManager>>,
         dkg_complete_notify: Arc<Notify>,
         my_secret_share: Arc<Mutex<Option<Fr>>>,
@@ -183,7 +183,7 @@ impl<H: BlockHandler> Core<H> {
             epoch_manager,
             rounds_in_epoch: public_config.parameters.rounds_in_epoch,
             committer,
-            fpc_sender,
+            fpc_client,
             linearizer,
             enable_block_fpc: public_config.parameters.enable_block_fpc,
             dkg_manager,
@@ -194,13 +194,24 @@ impl<H: BlockHandler> Core<H> {
 
         if !unprocessed_blocks.is_empty() {
             tracing::info!("Replaying {} blocks (sending to FPC service)", unprocessed_blocks.len());
-            for block in &unprocessed_blocks {
-                if let Err(e) = this.fpc_sender.try_send(FpcMessage::ProcessBlock(block.clone())) {
-                    tracing::warn!("Failed to replay block to FPC service: {:?}", e);
+            // 🌟 [변경] 비동기 호출을 위해 spawn 사용 (생성자에서는 await 불가)
+            // Core::open은 동기 함수이므로, tokio::spawn으로 처리합니다.
+            let client = this.fpc_client.clone();
+            let blocks = unprocessed_blocks.clone();
+            tokio::spawn(async move {
+                for block in blocks {
+                    client.send_block(block).await;
                 }
-            }
+            });
+
+            // 원래 로직대로 Core 내부 상태 복구는 동기적으로 수행
             let blocks_to_replay: Vec<_> = unprocessed_blocks.iter().map(|b| (b.clone(), true)).collect();
-            this.run_block_handler(&blocks_to_replay);
+            // this는 immutable이어야 하는데 run_block_handler는 mutable이 필요함.
+            // 생성자 패턴 상 여기서 호출하기 까다로우므로, 일단 원본 코드의 의도(핸들러 복구)를 살리기 위해
+            // mut this로 변경하고 호출합니다.
+            let mut mutable_this = this;
+            mutable_this.run_block_handler(&blocks_to_replay);
+            return mutable_this;
         }
 
         this
@@ -237,9 +248,14 @@ impl<H: BlockHandler> Core<H> {
             self.pending
                 .push_back((position, MetaStatement::Include(*block.reference())));
 
-            if let Err(e) = self.fpc_sender.try_send(FpcMessage::ProcessBlock(block.clone())) {
-                tracing::warn!("FPC channel full, dropping block from FPC: {:?}", block.reference());
-            }
+            let client = self.fpc_client.clone();
+            let block_clone = block.clone();
+            let metric = self.metrics.clone(); // 메트릭 증가용
+
+            tokio::spawn(async move {
+                client.send_block(block_clone).await;
+                // 큐 크기 메트릭 증가 (옵션)
+            });
 
             result_blocks.push(block.clone());
             blocks_for_handler.push((block, check_individual));
@@ -461,37 +477,24 @@ impl<H: BlockHandler> Core<H> {
 
         // 5. 🚀 [수정됨] FPC Service로 "진짜 리더 목록"만 전송
         if !committed_leaders.is_empty() {
-            // ❌ 이전 코드 (버그): SubDag 전체를 보냄 -> 중복 커밋 발생
-            // let msg = FpcMessage::CommittedLeaders(
-            //    committed_subdags.iter().flat_map(|sub_dag| sub_dag.blocks.clone()).collect()
-            // );
+            let client = self.fpc_client.clone();
+            let leaders = committed_leaders.clone();
+            let metric = self.metrics.clone();
 
-            // ✅ 수정된 코드 (정답): 선출된 리더(committed_leaders)만 보냄
-            // CommitHandler가 내부적으로 다시 Linearizer를 돌려 안전하게 저장함
-            let msg = FpcMessage::CommittedLeaders(committed_leaders.clone());
-
-            if let Err(e) = self.fpc_sender.try_send(msg) {
-                tracing::error!("Failed to send committed leaders to FPC service: {:?}", e);
-            }
+            tokio::spawn(async move {
+                client.send_committed_leaders(leaders).await;
+            });
         }
 
         committed_leaders
     }
 
     pub fn get_all_committed_tx_locators(&self) -> Vec<TransactionLocator> {
-        let (tx, rx) = oneshot::channel();
-        let msg = FpcMessage::GetLocators(tx);
-
-        // CoreThread는 동기 스레드이므로 blocking_send 사용
-        if let Err(e) = self.fpc_sender.blocking_send(msg) {
-            tracing::error!("Failed to send GetLocators request to FpcService: {:?}", e);
-            return vec![];
-        }
-
-        // 응답 대기
-        rx.blocking_recv().unwrap_or_else(|e| {
-            tracing::error!("Failed to receive GetLocators response: {:?}", e);
-            vec![]
+        let client = self.fpc_client.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                client.get_locators().await
+            })
         })
     }
 

@@ -1,20 +1,28 @@
-// crates/mysticeti-core/src/finalization_interpreter.rs
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::Mutex; // BlockHandler와 맞춤 (tokio::sync::Mutex일 수도 있으니 실제 코드 확인 필요)
+use parking_lot::Mutex;
 
-use crate::{block_handler::LedgerWriter, block_store::BlockStore, committee::{Committee, QuorumThreshold, StakeAggregator}, data::Data, metrics::Metrics, runtime, runtime::TimeInstant, types::{
-    AuthorityIndex, BaseStatement, BlockReference, StatementBlock, TransactionLocator, Vote,
-}};
-use crate::transactions_generator::TransactionGenerator;
-use crate::types::Transaction;
+use crate::{
+    block_handler::LedgerWriter,
+    block_store::BlockStore,
+    committee::{Committee, QuorumThreshold, StakeAggregator},
+    data::Data,
+    metrics::Metrics,
+    runtime,
+    runtime::TimeInstant,
+    types::{
+        AuthorityIndex, BaseStatement, BlockReference, StatementBlock, TransactionLocator, Vote,
+    },
+};
 
 pub struct FinalizationInterpreter<'a, L: LedgerWriter> {
+    // --- FPC Aggregators (Shared State) ---
     transaction_aggregator: &'a mut HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
     certificate_aggregator: &'a mut HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>,
-
     block_aggregator: &'a mut HashMap<BlockReference, HashMap<BlockReference, StakeAggregator<QuorumThreshold>>>,
     block_certificate_aggregator: &'a mut HashMap<BlockReference, StakeAggregator<QuorumThreshold>>,
 
@@ -22,9 +30,12 @@ pub struct FinalizationInterpreter<'a, L: LedgerWriter> {
     committee: Arc<Committee>,
     block_store: &'a BlockStore,
     block_level_fpc: bool,
-
-    // 🌟 [추가된 필드]
     metrics: Arc<Metrics>,
+
+    // --- GC / Pruning State (Shared State) ---
+    // FPCService가 관리하는 영구 상태를 참조로 받아옵니다.
+    blocks_by_round: &'a mut HashMap<u64, Vec<BlockReference>>,
+    highest_known_round: &'a mut u64,
 }
 
 impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
@@ -40,8 +51,12 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         certificate_aggregator: &'a mut HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>,
         block_aggregator: &'a mut HashMap<BlockReference, HashMap<BlockReference, StakeAggregator<QuorumThreshold>>>,
         block_certificate_aggregator: &'a mut HashMap<BlockReference, StakeAggregator<QuorumThreshold>>,
+
+        // 🌟 [신규 인자] GC 상태
+        blocks_by_round: &'a mut HashMap<u64, Vec<BlockReference>>,
+        highest_known_round: &'a mut u64,
+
         block_level_fpc: bool,
-        // 🌟 [추가된 인자]
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -53,11 +68,16 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
             committee,
             block_store,
             block_level_fpc,
-            metrics,        // 초기화
+            metrics,
+            blocks_by_round,
+            highest_known_round,
         }
     }
 
     pub fn process_block(&mut self, block: &Data<StatementBlock>) {
+        // 1. 라운드 업데이트 및 GC 수행
+        self.update_round_and_prune(block);
+
         if self.block_level_fpc {
             self.process_block_level(block);
         } else {
@@ -65,21 +85,75 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         }
     }
 
-    // 🌟 [Mode 1] 블록 단위 FPC - 메트릭 기록 로직 추가
+    // ------------------------------------------------------------------------
+    // 🌟 GC (Pruning) 로직
+    // ------------------------------------------------------------------------
+
+    fn update_round_and_prune(&mut self, block: &Data<StatementBlock>) {
+        let round = block.round();
+
+        // 1. 현재 블록을 라운드 인덱스에 등록
+        self.blocks_by_round.entry(round).or_default().push(*block.reference());
+
+        // 2. 최고 라운드 갱신
+        if round > *self.highest_known_round {
+            *self.highest_known_round = round;
+        }
+
+        // 3. 프루닝 임계값 설정 (최신 라운드 - 3)
+        // 3라운드 이전의 데이터는 더 이상 합의에 영향을 주지 않는다고 판단하여 삭제
+        let prune_threshold = self.highest_known_round.saturating_sub(3);
+
+        // 4. 임계값보다 오래된 라운드 데이터 삭제
+        // (한 번에 다 지우지 않고, 맵에 남아있는 '가장 오래된 라운드'부터 threshold까지 순차적으로 지우는 것이 안전하지만,
+        //  여기서는 retain을 사용하지 않고 인덱스 기반으로 효율적으로 삭제합니다.)
+
+        // 인덱스 맵에서 threshold 미만인 라운드 키들을 수집
+        let rounds_to_prune: Vec<u64> = self.blocks_by_round.keys()
+            .filter(|&r| *r < prune_threshold)
+            .cloned()
+            .collect();
+
+        for r in rounds_to_prune {
+            if let Some(block_refs) = self.blocks_by_round.remove(&r) {
+                for bref in block_refs {
+                    // [Block L1] 투표 집계 삭제
+                    self.block_aggregator.remove(&bref);
+                    // [Block L2] 인증서 집계 삭제
+                    self.block_certificate_aggregator.remove(&bref);
+
+                    // [Transaction L1] 이 블록이 관찰한 트랜잭션 투표 삭제
+                    // (참고: TX L2인 certificate_aggregator는 트랜잭션 확정 시점까지 유지해야 하므로 여기서 지우지 않음)
+                    self.transaction_aggregator.remove(&bref);
+                }
+                // tracing::debug!("🧹 [GC] Pruned FPC state for round {}", r);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // [Mode 1] 블록 단위 FPC
+    // ------------------------------------------------------------------------
+
     fn process_block_level(&mut self, block: &Data<StatementBlock>) {
+        // 🌟 [재귀 방지] 이미 프루닝된 오래된 블록은 처리하지 않음
+        let prune_threshold = self.highest_known_round.saturating_sub(3);
+        if block.round() < prune_threshold {
+            return;
+        }
+
         if self.block_aggregator.contains_key(block.reference()) {
             return;
         }
         self.block_aggregator.insert(*block.reference(), HashMap::new());
 
-        // 🔍 [로그 1] 블록 처리 시작 (너무 많으면 trace로 변경)
-        // FPC가 해당 블록을 인지했는지 확인
-        tracing::trace!("Processing block for FPC: {}", block.reference());
+        // tracing::trace!("Processing block for FPC: {}", block.reference());
 
         for parent_ref in block.includes() {
             if let Some(parent_block) = self.block_store.get_block(*parent_ref) {
                 self.process_block_level(&parent_block);
 
+                // [최적화 3] HashMap 전체 Clone 제거
                 let votes_to_cast: Vec<_> = self.block_aggregator
                     .get(parent_ref)
                     .unwrap()
@@ -89,23 +163,12 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
                     })
                     .collect();
 
-                // 🔍 [로그 2] 투표 계승(Vote Inheritance) 확인
-                // 부모로부터 투표를 물려받지 못하면 L1 인증이 전파되지 않음
-                // if !votes_to_cast.is_empty() {
-                //     tracing::trace!("Inherited {} votes from parent {}", votes_to_cast.len(), parent_ref);
-                // }
-
                 for (target_ref, voter) in votes_to_cast {
                     self.vote_block_level(block, target_ref, voter);
                 }
-            } else {
-                // 🚨 [로그 3] 부모 블록 누락 경고 (가장 흔한 실패 원인)
-                // 이 로그가 뜨면 FPC가 Core보다 빨라서 데이터를 못 찾고 있거나, 동기화 문제입니다.
-                tracing::warn!("⚠️ [FPC] Missing parent block {} required by {}", parent_ref, block.reference());
             }
         }
 
-        // 자기 자신의 투표 처리
         for parent_ref in block.includes() {
             self.vote_block_level(block, *parent_ref, block.author());
         }
@@ -120,79 +183,42 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         let observer_aggs = self.block_aggregator.get_mut(observer_block.reference()).unwrap();
         let l1_state = observer_aggs.entry(target_block_ref).or_default();
 
-        // 1. L1 투표 추가
-        let l1_was_quorum = l1_state.is_quorum(&self.committee);
+        // [L1] 상태 업데이트
         l1_state.add(voter, &self.committee);
-        let l1_is_quorum = l1_state.is_quorum(&self.committee);
+        let current_is_quorum = l1_state.is_quorum(&self.committee);
 
-        // 🔍 [로그 4] L1 인증(Certification) 달성 순간
-        if !l1_was_quorum && l1_is_quorum {
-            tracing::debug!("🎉 [FPC] L1 Certified block {} (triggered by {})", target_block_ref, observer_block.reference());
-        }
-
-        // 2. L2 진입 (L1 인증이 완료된 상태여야 함)
-        if l1_is_quorum {
+        // [L2] 진입 조건
+        if current_is_quorum {
             let l2_state = self.block_certificate_aggregator.entry(target_block_ref).or_default();
 
-            // Edge Trigger 확인을 위한 이전 상태 저장
             let l2_already_finalized = l2_state.is_quorum(&self.committee);
-
-            // L2 투표 추가 (Observer가 L1을 확인했음을 등록)
             l2_state.add(observer_block.author(), &self.committee);
-
             let l2_now_finalized = l2_state.is_quorum(&self.committee);
 
-            // 🔍 [로그 5] L2 투표 진행 상황 (디버깅용, 너무 많으면 주석 처리)
-            // tracing::trace!("   -> L2 Vote for {}: New Stake Added. Quorum reached? {}", target_block_ref, l2_now_finalized);
-
-            // 3. L2 확정(Finalization) 및 커밋 수행
+            // Edge Trigger: 확정(Finalized) 순간 커밋 수행
             if !l2_already_finalized && l2_now_finalized {
-                tracing::info!("🚀 [FPC] L2 FINALIZED Block {}! Starting commit...", target_block_ref);
-
                 if let Some(target_block) = self.block_store.get_block(target_block_ref) {
-                    let stmt_count = target_block.statements().len();
-                    let share_count = target_block.shared_transactions().count();
-
-                    tracing::info!(
-                    "🧐 [Inspect] Block {} content: Total Statements={}, Shared Txs={}",
-                    target_block_ref, stmt_count, share_count
-                );
-                    // 만약 트랜잭션이 하나라도 있다면 샘플 출력
-                    if share_count > 0 {
-                        tracing::info!("   -> First Tx found in block.");
-                    } else {
-                        tracing::warn!("   -> ⚠️ WARNING: Block is EMPTY (No 'Share' statements). It implies no transactions.");
-
-                        // (선택) Statements 타입 확인 (Vote만 들어있는지 확인)
-                        for (i, stmt) in target_block.statements().iter().take(5).enumerate() {
-                            tracing::info!("      Stmt[{}]: {:?}", i, stmt); // BaseStatement는 Debug 구현되어 있음
-                        }
-                    }
-                    let mut committed_count = 0;
+                    // tracing::debug!("FPC-BLOCK: Finalized block {} (all txs)", target_block_ref);
                     for (locator, _tx) in target_block.shared_transactions() {
                         if !self.ledger_writer.is_vote_finalized(&locator) {
                             self.ledger_writer.write_finalized_vote(locator, self.block_store, true);
-                            committed_count += 1;
                         }
                     }
-
-                    if committed_count > 0 {
-                        tracing::info!("✅ [FPC] Successfully committed {} txs from block {}", committed_count, target_block_ref);
-                    } else {
-                        tracing::info!("ℹ️ [FPC] Block {} finalized, but all txs were already processed.", target_block_ref);
-                    }
-                } else {
-                    // 🚨 [로그 6] 치명적 오류: 확정된 블록 본문을 찾을 수 없음
-                    tracing::error!("🔥 [FPC] CRITICAL: Finalized block {} not found in store!", target_block_ref);
                 }
             }
         }
     }
 
-    // [Mode 2] 트랜잭션 단위 - 메트릭 기록 로직 추가
+    // ------------------------------------------------------------------------
+    // [Mode 2] 트랜잭션 단위 FPC
+    // ------------------------------------------------------------------------
+
     fn process_transaction_level(&mut self, block: &Data<StatementBlock>) {
-        // ... (기존 로직 유지) ...
-        // process_transaction_level 내부 로직은 vote_transaction_level을 호출하므로 거기만 수정하면 됨
+        // 🌟 [재귀 방지]
+        let prune_threshold = self.highest_known_round.saturating_sub(3);
+        if block.round() < prune_threshold {
+            return;
+        }
 
         if self.transaction_aggregator.contains_key(block.reference()) { return; }
         self.transaction_aggregator.insert(*block.reference(), Default::default());
@@ -200,19 +226,21 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
         for parent_ref in block.includes() {
             if let Some(parent_block) = self.block_store.get_block(*parent_ref) {
                 self.process_transaction_level(&parent_block);
-                let parent_aggregator = self.transaction_aggregator.get(parent_ref).unwrap().clone();
-                let current_aggregator = self.transaction_aggregator.get_mut(block.reference()).unwrap(); // Unused variable warning fix
 
-                // 부모 상태 병합 및 투표 처리
-                for (locator, agg) in parent_aggregator {
-                    for voter in agg.voters() {
-                        self.vote_transaction_level(block, &locator, voter);
+                // unwrap 안전 장치: GC로 인해 parent가 삭제되었을 수 있음
+                if let Some(parent_aggregator) = self.transaction_aggregator.get(parent_ref) {
+                    let parent_aggregator = parent_aggregator.clone();
+
+                    // 부모 상태 병합
+                    for (locator, agg) in parent_aggregator {
+                        for voter in agg.voters() {
+                            self.vote_transaction_level(block, &locator, voter);
+                        }
                     }
                 }
             }
         }
 
-        // 현재 블록의 Statement 처리
         for (offset, statement) in block.statements().iter().enumerate() {
             match statement {
                 BaseStatement::Vote(locator, vote) => {
@@ -249,31 +277,21 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
             .unwrap();
 
         let state = block_transaction_aggregator.entry(*transaction).or_default();
-
-        // [수정] L1 상태 업데이트만 수행
         state.add(tx_voter, &self.committee);
-
-        // L1 쿼럼 확인
         let current_is_quorum = state.is_quorum(&self.committee);
-
-        // ❌ [삭제됨] L1 인증 시점 메트릭 업데이트 로직 제거
-        // if !already_certified && current_is_quorum { ... }
 
         if !current_is_quorum || block.epoch_changed() {
             return;
         }
 
-        // --- L2: 인증서 집계 및 확정 ---
         let cert_aggregator = self.certificate_aggregator.entry(*transaction).or_default();
-
         let l2_was_quorum = cert_aggregator.is_quorum(&self.committee);
         cert_aggregator.add(block.author(), &self.committee);
         let l2_is_quorum = cert_aggregator.is_quorum(&self.committee);
 
         if !l2_was_quorum && l2_is_quorum {
-            tracing::debug!("FPC-TX: Finalized transaction {}", transaction);
+            // tracing::debug!("FPC-TX: Finalized transaction {}", transaction);
             self.ledger_writer.write_finalized_vote(*transaction, self.block_store, true);
         }
     }
 }
-

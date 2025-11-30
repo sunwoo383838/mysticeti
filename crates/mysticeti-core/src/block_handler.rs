@@ -664,6 +664,7 @@ impl CommitObserver for CommitHandler {
         transaction_aggregator: &HashMap<BlockReference, HashMap<TransactionLocator, StakeAggregator<QuorumThreshold>>>,
     ) -> Vec<CommittedSubDag> {
         // 1. 함수 진입 및 처리할 리더 수 로깅
+        tracing::info!("➡️ [C-PATH] handle_commit: Start processing {} committed leaders.", committed_leaders.len());
 
         let committed = self
             .commit_interpreter
