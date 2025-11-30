@@ -12,6 +12,7 @@ use ark_groth16::prepare_verifying_key;
 use eyre::{eyre, Context, Result};
 use tokio::sync::{Mutex, Notify};
 use crate::{block_handler, block_handler::{RealBlockHandler, CommitHandler}, block_store::BlockStore, committee::Committee, config::{ClientParameters, NodePrivateConfig, NodePublicConfig}, core::{Core, CoreOptions}, log::TransactionLog, metrics::Metrics, net_sync::NetworkSyncer, network::Network, prometheus, runtime::{JoinError, JoinHandle}, transactions_generator::TransactionGenerator, types::AuthorityIndex, wal::{self, walf}};
+use crate::block_handler::ExecutionService;
 use crate::config::{CryptoConfig, FaultConfig};
 use crate::dkg_manager::DkgManager;
 use crate::fpc_service::FpcService;
@@ -92,16 +93,18 @@ impl Validator {
             fault_config.clone(),
         );
 
-        let committed_transaction_log =
-            TransactionLog::start(private_config.committed_transactions_log())
-                .expect("Failed to open committed transaction log for write");
+        // 🌟 [수정] ExecutionService (병렬 실행기) 생성
+        // 파일 로그(TransactionLog) 대신 RocksDB를 사용하므로 committed_transaction_log 생성 로직은 제거됨
+        let (execution_sender, _execution_handle) = ExecutionService::spawn_parallel(
+            nullifier_db.clone(),
+            metrics.clone(),
+            block_handler.transaction_time.clone(),
+        );
 
+        // 🌟 [수정] CommitHandler 생성 (Execution Sender 주입)
         let commit_handler = CommitHandler::new(
             committee.clone(),
-            block_handler.transaction_time.clone(),
-            metrics.clone(),
-            nullifier_db.clone(),
-            committed_transaction_log,
+            execution_sender, // 🚀 병렬 실행 서비스로 연결되는 채널
             &public_config,
         );
 

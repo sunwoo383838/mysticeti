@@ -196,11 +196,11 @@ impl<'a, L: LedgerWriter> FinalizationInterpreter<'a, L> {
             // Edge Trigger: 확정(Finalized) 순간 커밋 수행
             if !l2_already_finalized && l2_now_finalized {
                 if let Some(target_block) = self.block_store.get_block(target_block_ref) {
-                    for (locator, _tx) in target_block.shared_transactions() {
-                        if !self.ledger_writer.is_vote_finalized(&locator) {
-                            self.ledger_writer.write_finalized_vote(locator, self.block_store, true);
-                        }
-                    }
+
+                    // 🌟 [수정] 블록 전체를 넘겨서 일괄 처리 (DB 조회 제거)
+                    self.ledger_writer.write_finalized_block(&target_block, true); // is_fpc = true
+
+                    // 기존의 for 루프 + write_finalized_vote 호출 코드는 제거됨
                 }
 
                 // [최적화 2] Finalized 즉시 현재 블록의 Aggregator에서 제거

@@ -6,6 +6,7 @@ use rocksdb::{BlockBasedOptions, Options, TransactionDB, TransactionDBOptions, W
 use crate::metrics::Metrics;
 use eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Serialize};
+use crate::types::TransactionLocator;
 
 #[derive(Serialize, Deserialize, Debug)]
 enum NullifierState {
@@ -14,6 +15,7 @@ enum NullifierState {
 }
 
 const CF_NULLIFIER: &str = "nullifiers";
+const CF_COMMITTED: &str = "committed";
 
 #[derive(Clone)]
 pub struct NullifierDB {
@@ -48,7 +50,7 @@ impl NullifierDB {
             &opts,
             &txn_db_opts,
             db_path.clone(),
-            vec![CF_NULLIFIER],
+            vec![CF_NULLIFIER, CF_COMMITTED],
         ).wrap_err(format!("Failed to open NullifierDB at {}", db_path.display()))?;
 
         Ok(Self {
@@ -217,6 +219,33 @@ impl NullifierDB {
             batch.delete_cf(&cf, &key);
         }
 
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    pub fn commit_execution_batch(
+        &self,
+        nullifiers: Vec<Fr>,
+        locators: Vec<TransactionLocator>
+    ) -> Result<()> {
+        let cf_nullifier = self.db.cf_handle(CF_NULLIFIER).ok_or_else(|| eyre!("CF_NULLIFIER not found"))?;
+        let cf_committed = self.db.cf_handle(CF_COMMITTED).ok_or_else(|| eyre!("CF_COMMITTED not found"))?;
+
+        let mut batch = WriteBatchWithTransaction::<true>::default();
+
+        // 1. Nullifier 상태 업데이트 (Commit)
+        let commit_state_val = bincode::serialize(&NullifierState::Commit)?;
+        for nullifier in nullifiers {
+            let key = serialize_to_vec![nullifier]?;
+            batch.put_cf(&cf_nullifier, &key, &commit_state_val);
+        }
+
+        for locator in locators {
+            let key = bincode::serialize(&locator)?;
+            batch.put_cf(&cf_committed, &key, &[]);
+        }
+
+        // 원자적 쓰기 (Atomic Write)
         self.db.write(batch)?;
         Ok(())
     }

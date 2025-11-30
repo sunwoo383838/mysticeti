@@ -36,6 +36,7 @@ use crate::{
     wal::{open_file_for_wal, walf, WalPosition, WalWriter},
 };
 use tokio::sync::{Mutex, Notify};
+use crate::block_handler::ExecutionService;
 use crate::fpc_service::FpcService;
 // ❗ 추가
 
@@ -123,15 +124,19 @@ pub fn committee_and_cores_persisted_epoch_duration(
             // --- ❗ (수정) Core::open에 전달할 CommitHandler 생성 ---
             let nullifier_db = Arc::new(NullifierDB::new(metrics.clone()).unwrap());
             // 테스트 로그는 임시 파일에 저장
-            let commit_log_path = tempfile::NamedTempFile::new().unwrap();
-            let committed_transaction_log = TransactionLog::start(commit_log_path.path()).unwrap();
 
+            // 🌟 [수정] ExecutionService (병렬 실행기) 생성
+            // 파일 로그(TransactionLog) 대신 RocksDB를 사용하므로 committed_transaction_log 생성 로직은 제거됨
+            let (execution_sender, _execution_handle) = ExecutionService::spawn_parallel(
+                nullifier_db.clone(),
+                metrics.clone(),
+                block_handler.transaction_time.clone(),
+            );
+
+            // 🌟 [수정] CommitHandler 생성 (Execution Sender 주입)
             let commit_handler = CommitHandler::new(
                 committee.clone(),
-                block_handler.transaction_time.clone(),
-                metrics.clone(),
-                nullifier_db,
-                committed_transaction_log,
+                execution_sender, // 🚀 병렬 실행 서비스로 연결되는 채널
                 &public_config,
             );
 
