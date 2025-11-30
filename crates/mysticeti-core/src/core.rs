@@ -196,13 +196,9 @@ impl<H: BlockHandler> Core<H> {
             tracing::info!("Replaying {} blocks (sending to FPC service)", unprocessed_blocks.len());
             // 🌟 [변경] 비동기 호출을 위해 spawn 사용 (생성자에서는 await 불가)
             // Core::open은 동기 함수이므로, tokio::spawn으로 처리합니다.
-            let client = this.fpc_client.clone();
-            let blocks = unprocessed_blocks.clone();
-            tokio::spawn(async move {
-                for block in blocks {
-                    client.send_block(block).await;
-                }
-            });
+            for block in unprocessed_blocks.clone() {
+                this.fpc_client.send_block(block);
+            }
 
             // 원래 로직대로 Core 내부 상태 복구는 동기적으로 수행
             let blocks_to_replay: Vec<_> = unprocessed_blocks.iter().map(|b| (b.clone(), true)).collect();
@@ -250,14 +246,7 @@ impl<H: BlockHandler> Core<H> {
             self.pending
                 .push_back((position, MetaStatement::Include(*block.reference())));
 
-            let client = self.fpc_client.clone();
-            let block_clone = block.clone();
-            let metric = self.metrics.clone(); // 메트릭 증가용
-
-            tokio::spawn(async move {
-                client.send_block(block_clone).await;
-                // 큐 크기 메트릭 증가 (옵션)
-            });
+            self.fpc_client.send_block(block.clone());
 
             result_blocks.push(block.clone());
             blocks_for_handler.push((block, check_individual));
@@ -479,13 +468,7 @@ impl<H: BlockHandler> Core<H> {
 
         // 5. 🚀 [수정됨] FPC Service로 "진짜 리더 목록"만 전송
         if !committed_leaders.is_empty() {
-            let client = self.fpc_client.clone();
-            let leaders = committed_leaders.clone();
-            let metric = self.metrics.clone();
-
-            tokio::spawn(async move {
-                client.send_committed_leaders(leaders).await;
-            });
+            self.fpc_client.send_committed_leaders(committed_leaders.clone());
         }
 
         committed_leaders

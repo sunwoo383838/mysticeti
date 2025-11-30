@@ -24,17 +24,22 @@ pub struct FpcClient {
 }
 
 impl FpcClient {
-    pub async fn send_block(&self, block: Data<StatementBlock>) {
+    pub fn send_block(&self, block: Data<StatementBlock>) {
         self.metrics.fpc_block_enqueued.inc();
-        if let Err(e) = self.block_sender.send(block).await {
-            tracing::warn!("Failed to send block to FPC service: {:?}", e);
+
+        // try_send는 채널이 가득 차면 에러를 반환하지만 스레드를 멈추지 않음
+        if let Err(e) = self.block_sender.try_send(block) {
+            // 큐가 가득 찼을 때의 로그 (디버그용)
+            tracing::debug!("Failed to send block to FPC service (queue full?): {:?}", e);
         }
     }
 
-    pub async fn send_committed_leaders(&self, leaders: Vec<Data<StatementBlock>>) {
+    // 🌟 [수정 2] async 제거, try_send 사용
+    pub fn send_committed_leaders(&self, leaders: Vec<Data<StatementBlock>>) {
         self.metrics.fpc_commit_enqueued.inc();
-        if let Err(e) = self.commit_sender.send(leaders).await {
-            tracing::error!("Failed to send committed leaders to FPC service: {:?}", e);
+
+        if let Err(e) = self.commit_sender.try_send(leaders) {
+            tracing::error!("Failed to send committed leaders to FPC service (queue full?): {:?}", e);
         }
     }
 
